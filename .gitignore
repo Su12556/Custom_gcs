@@ -1,0 +1,29 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*.class
+.pytest_cache/
+
+# Local Media & Large Files
+recordings/
+snapshots/
+*.mp4
+*.jpg
+*.png
+*.tif
+*.tiff
+data/elevation.tif
+
+# Mission temporary plans
+*.plan
+*.json
+
+# VS Code & IDE settings
+.vscode/
+.idea/
+*.log

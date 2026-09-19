@@ -1,0 +1,251 @@
+<!doctype html><html lang='en'><head><meta charset='utf-8'/><meta name='viewport' content='width=device-width,initial-scale=1'/><title>DOOAF Observation Report</title><style>
+:root{
+  --bg:#e8edf4;--bg2:#f8fafc;--card:#fff;--border:#d1dae6;--border-light:#e8edf3;
+  --text:#0f172a;--muted:#64748b;--accent:#2563eb;--good:#15803d;--warn:#b45309;
+  --bad:#b91c1c;--target:#1d4ed8;--impact:#15803d;--corr:#c2410c;--teal:#0d9488;
+  --radius:14px;--radius-sm:10px;--shadow-sm:0 1px 3px rgba(15,23,42,.08);
+  --font:'Segoe UI',system-ui,sans-serif;--mono:Consolas,monospace;
+}
+*,*::before,*::after{box-sizing:border-box;}
+body{margin:0;background:linear-gradient(165deg,var(--bg2) 0%,var(--bg) 100%);color:var(--text);font-family:var(--font);line-height:1.5;}
+.report-page{max-width:1280px;margin:0 auto;padding:20px 16px 48px;}
+.report-header{background:linear-gradient(135deg,#0c1222 0%,#1e3a5f 55%,#0f4c5c 100%);color:#f8fafc;border-radius:var(--radius);padding:24px 28px;box-shadow:var(--shadow-sm);}
+.report-header-inner{display:flex;flex-wrap:wrap;gap:20px;align-items:flex-start;justify-content:space-between;}
+.report-brand{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.12em;color:#94a3b8;margin-bottom:6px;}
+.report-header h1{margin:0 0 8px;font-size:1.5rem;font-weight:700;}
+.report-meta{display:flex;flex-wrap:wrap;gap:8px 16px;font-size:13px;color:#cbd5e1;}
+.report-meta-pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;background:rgba(255,255,255,.08);border-radius:999px;border:1px solid rgba(255,255,255,.12);}
+.hero-kpis{display:flex;flex-wrap:wrap;gap:10px;align-items:stretch;}
+.hero-kpi{min-width:105px;padding:12px 14px;border-radius:var(--radius-sm);background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.15);backdrop-filter:blur(8px);text-align:center;}
+.hero-kpi-val{display:block;font-size:1.25rem;font-weight:800;color:#fff;}
+.hero-kpi-label{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-top:4px;font-weight:600;}
+.hero-kpi-miss .hero-kpi-val{color:#fdba74;}
+.hero-kpi-range .hero-kpi-val{color:#7dd3fc;}
+.hero-kpi-defl .hero-kpi-val{color:#c4b5fd;}
+.hero-kpi-elev .hero-kpi-val{color:#fef08a;}
+.report-executive{background:linear-gradient(165deg,#ecfdf5 0%,#fff 45%,#f0fdf4 100%);border:1px solid #6ee7b7;border-radius:var(--radius);margin-bottom:18px;margin-top:18px;box-shadow:var(--shadow-sm);overflow:hidden;}
+.report-executive-head{padding:16px 22px;border-bottom:1px solid #a7f3d0;background:rgba(16,185,129,.08);}
+.report-executive h2{margin:0;font-size:1.15rem;color:#065f46;font-weight:800;}
+.report-executive-body{padding:18px 22px 22px;}
+.exec-story-lead{margin:0 0 14px;padding:14px 16px;background:rgba(255,255,255,.7);border:1px solid #a7f3d0;border-radius:var(--radius-sm);}
+.exec-story-lead p{margin:0;font-size:1rem;color:#134e4a;line-height:1.55;}
+.exec-story-lead .exec-big{font-size:1.35rem;font-weight:800;color:#065f46;}
+.exec-split{display:grid;grid-template-columns:1fr auto 1.3fr;gap:12px;margin-top:18px;align-items:stretch;}
+.exec-split-bridge{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:0 4px;color:var(--muted);text-align:center;}
+.exec-bridge-arrow{display:flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:50%;background:#f1f5f9;border:2px solid var(--border);font-size:18px;font-weight:700;}
+.exec-miss-panel,.exec-corr-panel{background:#fff;border:1px solid var(--border-light);border-radius:var(--radius-sm);overflow:hidden;box-shadow:var(--shadow-sm);}
+.exec-panel-header{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border-light);}
+.exec-panel-header-miss{background:#fff7ed;}
+.exec-panel-header-corr{background:#ecfdf5;}
+.exec-panel-title{font-size:13px;font-weight:700;color:var(--text);}
+.exec-panel-body{padding:14px 16px;}
+.fc-action-cards{display:grid;grid-template-columns:repeat(auto-fit, minmax(130px, 1fr));gap:10px;}
+.fc-action-card{background:#fff;border:2px solid #99f6e4;border-radius:var(--radius-sm);padding:12px 10px;text-align:center;}
+.fc-action-card-range{border-color:#fdba74;background:linear-gradient(180deg,#fff7ed 0%,#fff 100%);}
+.fc-action-card-defl{border-color:#c4b5fd;background:linear-gradient(180deg,#f5f3ff 0%,#fff 100%);}
+.fc-action-card-map{border-color:#5eead4;background:linear-gradient(180deg,#ecfdf5 0%,#fff 100%);}
+.fc-action-card-elev{border-color:#fcd34d;background:linear-gradient(180deg,#fefce8 0%,#fff 100%);}
+.fc-action-arrow{font-size:1.5rem;font-weight:700;margin-bottom:2px;}
+.fc-action-card-range .fc-action-arrow{color:#ea580c;}
+.fc-action-card-defl .fc-action-arrow{color:#7c3aed;}
+.fc-action-card-map .fc-action-arrow{color:#0d9488;}
+.fc-action-card-elev .fc-action-arrow{color:#d97706;}
+.fc-action-label{font-size:10px;text-transform:uppercase;color:var(--muted);font-weight:600;}
+.fc-action-num{font-size:1.2rem;font-weight:800;color:var(--text);margin-left:4px;}
+.data-table{width:100%;border-collapse:collapse;font-size:13px;border:1px solid var(--border-light);border-radius:var(--radius-sm);margin-top:10px;}
+.data-table th,.data-table td{padding:10px 14px;border-bottom:1px solid var(--border-light);text-align:left;}
+.data-table thead th{background:#f1f5f9;color:#475569;font-size:11px;text-transform:uppercase;}
+.section-card{background:var(--card);border:1px solid var(--border-light);border-radius:var(--radius);margin-bottom:18px;padding:20px;box-shadow:var(--shadow-sm);}
+.mono{font-family:var(--mono);font-size:12px;}
+@media (max-width:800px){.exec-split{grid-template-columns:1fr;}.fc-action-cards{grid-template-columns:1fr;}}
+</style></head><body><div class='report-page'>
+
+<header class='report-header'>
+  <div class='report-header-inner'>
+    <div>
+      <div class='report-brand'>VIKAS GCS · DOOAF FIRE OBSERVATION</div>
+      <h1>Observation Report</h1>
+      <div class='report-meta'>
+        <span class='report-meta-pill'><strong>Mission Time</strong> 2026-09-17 08:51 UTC</span>
+        <span class='report-meta-pill'><strong>Line of Fire</strong> 285.1° TN</span>
+      </div>
+    </div>
+    <div class='hero-kpis'>
+      <div class='hero-kpi hero-kpi-miss'><span class='hero-kpi-val'>1147.3 m</span><span class='hero-kpi-label'>Total Miss</span></div>
+      <div class='hero-kpi hero-kpi-range'><span class='hero-kpi-val'>Add 574.7m</span><span class='hero-kpi-label'>Range Shift</span></div>
+      <div class='hero-kpi hero-kpi-defl'><span class='hero-kpi-val'>Left 993.0m</span><span class='hero-kpi-label'>Deflection</span></div>
+      <div class='hero-kpi hero-kpi-elev'><span class='hero-kpi-val'>Up 0.0m</span><span class='hero-kpi-label'>Height Corr</span></div>
+    </div>
+  </div>
+</header>
+
+<section class='report-executive'>
+  <div class='report-executive-head'><h2>Executive Summary</h2></div>
+  <div class='report-executive-body'>
+    <div class='exec-story-lead'>
+      <p><span class='exec-big'>1147.3 m</span> horizontal ground miss from target.</p>
+      <p>Impact landed <strong>810.1m North, 814.3m East</strong>, and <strong>0.0m Above</strong> target elevation.</p>
+      <p>Correction requires: <strong>Add 574.7 m</strong> range, <strong>Left 993.0 m</strong> deflection, and <strong>Up 0.0 m</strong> vertical adjustment.</p>
+    </div>
+
+    <div class='exec-split'>
+      <div class='exec-miss-panel'>
+        <div class='exec-panel-header exec-panel-header-miss'><span class='exec-panel-title'>1. Where Round Landed</span></div>
+        <div class='exec-panel-body'>
+          <svg viewBox='0 0 360 360' width='100%' xmlns='http://www.w3.org/2000/svg' style='background:#f8fafc;border-radius:8px;'>
+            <line x1='180' y1='20' x2='180' y2='340' stroke='#cbd5e1' stroke-width='1' stroke-dasharray='4,4'/>
+            <line x1='20' y1='180' x2='340' y2='180' stroke='#cbd5e1' stroke-width='1' stroke-dasharray='4,4'/>
+            <text x='180' y='32' text-anchor='middle' font-size='11' fill='#64748b' font-weight='bold'>N</text>
+            <text x='330' y='184' text-anchor='middle' font-size='11' fill='#64748b' font-weight='bold'>E</text>
+
+            <circle cx='180' cy='180' r='8' fill='#16a34a'/>
+            <text x='180' y='165' text-anchor='middle' font-size='10' fill='#16a34a' font-weight='bold'>Target (0.0m)</text>
+            <line x1='180' y1='180' x2='280.0' y2='80.0' stroke='#ea580c' stroke-width='2.5'/>
+            <circle cx='280.0' cy='80.0' r='9' fill='#dc2626'/>
+            <text x='280.0' y='98.0' text-anchor='middle' font-size='10' fill='#dc2626' font-weight='bold'>Impact (0.0m)</text>
+          </svg>
+        </div>
+      </div>
+
+      <div class='exec-split-bridge'><span class='exec-bridge-arrow'>→</span></div>
+
+      <div class='exec-corr-panel'>
+        <div class='exec-panel-header exec-panel-header-corr'><span class='exec-panel-title'>2. Adjustments For Next Round</span></div>
+        <div class='exec-panel-body'>
+          <div class='fc-action-cards'>
+            <div class='fc-action-card fc-action-card-range'>
+              <div class='fc-action-arrow'>⟶</div>
+              <div class='fc-action-label'>Range Shift</div>
+              <div><strong>Add</strong><span class='fc-action-num'>574.7m</span></div>
+            </div>
+            <div class='fc-action-card fc-action-card-defl'>
+              <div class='fc-action-arrow'>↶</div>
+              <div class='fc-action-label'>Deflection</div>
+              <div><strong>Left</strong><span class='fc-action-num'>451.8</span></div>
+            </div>
+            <div class='fc-action-card fc-action-card-elev'>
+              <div class='fc-action-arrow'>↑</div>
+              <div class='fc-action-label'>Height Corr</div>
+              <div><strong>Up</strong><span class='fc-action-num'>0.0m</span></div>
+            </div>
+            <div class='fc-action-card fc-action-card-map'>
+              <div class='fc-action-arrow'>←</div>
+              <div class='fc-action-label'>East / West</div>
+              <div><strong>West</strong><span class='fc-action-num'>814.3m</span></div>
+            </div>
+            <div class='fc-action-card fc-action-card-map'>
+              <div class='fc-action-arrow'>↓</div>
+              <div class='fc-action-label'>North / South</div>
+              <div><strong>South</strong><span class='fc-action-num'>810.1m</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- SECTION: Geodetic Separation Network -->
+<section class='section-card'>
+  <h3 style='margin-top:0'>Observation Distance Network</h3>
+  <table class='data-table'>
+    <thead>
+      <tr>
+        <th>Baseline Relationship</th>
+        <th>Ground Distance</th>
+        <th>Reference Significance</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr style='background:#ecfdf5'>
+        <td><strong>Actual Target ↔ Impact Point</strong></td>
+        <td class='mono'><strong>1147.34 meters</strong></td>
+        <td>Total Horizontal Fall-of-Shot Error</td>
+      </tr>
+      <tr>
+        <td><strong>Drone ↔ Actual Target</strong></td>
+        <td class='mono'>8660264.76 meters</td>
+        <td>Spotter Slant Baseline to Designated Target</td>
+      </tr>
+      <tr>
+        <td><strong>Drone ↔ Impact Point</strong></td>
+        <td class='mono'>8661117.21 meters</td>
+        <td>Spotter Slant Baseline to Observed Fall-of-Shot</td>
+      </tr>
+      <tr>
+        <td><strong>Artillery Gun ↔ Target</strong></td>
+        <td class='mono'>2090.20 meters</td>
+        <td>Ballistic Line-of-Fire Range to Target (GTL)</td>
+      </tr>
+      <tr>
+        <td><strong>Artillery Gun ↔ Impact Point</strong></td>
+        <td class='mono'>1811.78 meters</td>
+        <td>Actual Shell Travel Distance from Battery</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- SECTION: Positions & Fire Correction Master Table -->
+<section class='section-card'>
+  <h3 style='margin-top:0'>Positions &amp; Fire Correction Master Table</h3>
+  <table class='data-table'>
+    <thead>
+      <tr>
+        <th>Entity / Parameter</th>
+        <th>Latitude</th>
+        <th>Longitude</th>
+        <th>Elevation / Alt</th>
+        <th>Firing Bearing / Deflection</th>
+        <th>Applied Correction</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Artillery Battery (Gun)</strong></td>
+        <td class='mono'>12.970978°</td>
+        <td class='mono'>77.579739°</td>
+        <td>Base Origin</td>
+        <td>0.00° (Origin)</td>
+        <td>Baseline Reference</td>
+      </tr>
+      <tr style='background:#eff6ff'>
+        <td><strong>Actual Target</strong></td>
+        <td class='mono'>12.975871°</td>
+        <td class='mono'>77.561114°</td>
+        <td><strong>0.0 m MSL</strong></td>
+        <td>285.09° TN (GTL)</td>
+        <td>Intended Aim Point</td>
+      </tr>
+      <tr style='background:#ecfdf5'>
+        <td><strong>Impact Point</strong></td>
+        <td class='mono'>12.983148°</td>
+        <td class='mono'>77.568621°</td>
+        <td><strong>0.0 m MSL</strong></td>
+        <td>Miss Dist: 1147.34 m</td>
+        <td>Observed Fall of Shot</td>
+      </tr>
+      <tr>
+        <td><strong>Drone Spotter</strong></td>
+        <td class='mono'>0.000000°</td>
+        <td class='mono'>0.000000°</td>
+        <td>5.7 m AGL</td>
+        <td>HDG: 149.0°</td>
+        <td>Observation Platform</td>
+      </tr>
+      <tr style='background:#fff7ed'>
+        <td><strong>Fire Shift Orders</strong></td>
+        <td colspan='2' class='mono'>ΔN: +810.1m | ΔE: +814.3m</td>
+        <td><strong style='color:#b45309;'>Up 0.0m</strong></td>
+        <td class='mono'>Left 451.8 mils</td>
+        <td><strong>Add 574.7m, Left 993.0m, Up 0.0m</strong></td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<footer style='text-align:center;font-size:12px;color:var(--muted);margin-top:24px;'>
+  <strong>VIKAS GCS</strong> · DOOAF Observation Mission Export · Certified Ballistic Data
+</footer>
+
+</div></body></html>

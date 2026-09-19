@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        html,
+        body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background: #0b0f19;
+            overflow: hidden;
+        }
+
+        #map {
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            left: 0;
+            right: 0;
+        }
+
+        .leaflet-tile-pane {
+            filter: brightness(1.0) contrast(1.05);
+        }
+
+        .leaflet-top.leaflet-right {
+            top: 8px !important;
+            right: 8px !important;
+        }
+
+        .leaflet-bar {
+            border: 1px solid #facc15 !important;
+            box-shadow: 0 0 8px rgba(250, 204, 21, 0.4) !important;
+        }
+
+        .leaflet-bar a {
+            width: 26px !important;
+            height: 26px !important;
+            line-height: 24px !important;
+            font-size: 16px !important;
+            font-weight: bold !important;
+            background-color: rgba(15, 23, 42, 0.95) !important;
+            color: #facc15 !important;
+            border-bottom: 1px solid #334155 !important;
+            text-align: center !important;
+        }
+
+        .uav-base-wrap {
+            width: 52px;
+            height: 52px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .uav-rotator {
+            width: 52px;
+            height: 52px;
+            transform-origin: center center;
+            transition: transform 0.15s linear;
+        }
+
+        .uav-svg-icon {
+            width: 52px;
+            height: 52px;
+            filter: drop-shadow(0px 0px 8px rgba(0, 229, 255, 1));
+        }
+
+        .qgc-wp-pin {
+            background: #0284c7;
+            color: #ffffff;
+            font-family: 'Consolas', monospace;
+            font-weight: 900;
+            font-size: 11px;
+            border-radius: 50%;
+            width: 26px;
+            height: 26px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 2px solid #38bdf8;
+            box-shadow: 0 0 8px rgba(56, 189, 248, 0.8);
+            cursor: pointer;
+        }
+
+        .qgc-home-pin {
+            background: #15803d;
+            border-color: #4ade80;
+            color: white;
+            font-weight: 900;
+            font-size: 11px;
+            border-radius: 50%;
+            width: 28px;
+            height: 28px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 2px solid #4ade80;
+            box-shadow: 0 0 8px rgba(34, 197, 94, 0.8);
+        }
+    </style>
+</head>
+
+<body>
+    <div id="map"></div>
+    <script>
+        var map = null;
+        var droneMarker = null, gunMarker = null, homeMarker = null;
+        var targetMarker = null, impactMarker = null;
+        var activeMode = "NONE";
+        var currentHeading = 0.0;
+        var hasCenteredOnDrone = false;
+
+        var waypoints = [];
+        var missionPolyline = null;
+        var returnPolyline = null;
+        var currentCruiseAlt = 30.0;
+        var currentCruiseSpeed = 5.0;
+        var defaultHoverSec = 0.0;
+        var plottedInspectMarkers = [];
+
+        function fixMapSize() {
+            if (map) { map.invalidateSize(true); }
+        }
+
+        function setSelectionMode(mode) { activeMode = mode; }
+        function setCruiseAltitude(alt) { currentCruiseAlt = parseFloat(alt) || 30.0; }
+
+        function createDroneIcon(heading) {
+            var svgHtml = `
+                <div class="uav-base-wrap">
+                    <div id="uav_rot_disc" class="uav-rotator" style="transform: rotate(${heading}deg);">
+                        <svg class="uav-svg-icon" viewBox="0 0 50 50" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <circle cx="25" cy="25" r="14" stroke="#d946ef" stroke-width="2.5" stroke-dasharray="4 2" opacity="0.9"/>
+                            <line x1="25" y1="5" x2="25" y2="45" stroke="#00e5ff" stroke-width="3.5" stroke-linecap="round"/>
+                            <line x1="5" y1="25" x2="45" y2="25" stroke="#00e5ff" stroke-width="3.5" stroke-linecap="round"/>
+                            <polygon points="25,0 35,17 25,11 15,17" fill="#ffffff" stroke="#00e5ff" stroke-width="2"/>
+                            <polygon points="25,5 31,14 25,10 19,14" fill="#00ffcc"/>
+                            <circle cx="25" cy="5" r="4" fill="#ffffff" stroke="#00e5ff" stroke-width="1.5"/>
+                            <circle cx="25" cy="45" r="4" fill="#ffffff" stroke="#00e5ff" stroke-width="1.5"/>
+                            <circle cx="5" cy="25" r="4" fill="#ffffff" stroke="#00e5ff" stroke-width="1.5"/>
+                            <circle cx="45" cy="25" r="4" fill="#ffffff" stroke="#00e5ff" stroke-width="1.5"/>
+                            <circle cx="25" cy="25" r="6" fill="#00e5ff" stroke="#ffffff" stroke-width="2"/>
+                            <circle cx="25" cy="25" r="2.5" fill="#ffffff"/>
+                        </svg>
+                    </div>
+                </div>`;
+            return L.divIcon({ html: svgHtml, className: '', iconSize: [52, 52], iconAnchor: [26, 26] });
+        }
+
+        function setHomePosition(lat, lon) {
+            if (!map || !lat) return;
+            var pos = [lat, lon];
+            if (!homeMarker) {
+                var homeIcon = L.divIcon({ html: '<div class="qgc-home-pin">H</div>', className: '', iconSize: [28, 28], iconAnchor: [14, 14] });
+                homeMarker = L.marker(pos, { icon: homeIcon }).addTo(map);
+                homeMarker.bindPopup("<b>Home Position</b>");
+            } else {
+                homeMarker.setLatLng(pos);
+            }
+            redrawMissionRoute();
+        }
+
+        function addWaypoint(lat, lon, alt, speed, hover) {
+            var wpNum = waypoints.length + 1;
+            var wpAlt = alt || currentCruiseAlt;
+            var wpSpd = speed || currentCruiseSpeed;
+            var wpHov = hover !== undefined ? hover : defaultHoverSec;
+
+            var wpIcon = L.divIcon({
+                html: `<div class="qgc-wp-pin" id="wp_icon_${wpNum}">${wpNum}</div>`,
+                className: '',
+                iconSize: [26, 26],
+                iconAnchor: [13, 13]
+            });
+
+            var marker = L.marker([lat, lon], { icon: wpIcon, draggable: true }).addTo(map);
+            marker.bindPopup(`<b>WP #${wpNum}</b><br>Alt: ${wpAlt}m<br>Speed: ${wpSpd}m/s<br>Hover: ${wpHov}s`);
+
+            marker.on('drag', function () {
+                var newPos = marker.getLatLng();
+                var idx = waypoints.findIndex(w => w.marker === marker);
+                if (idx !== -1) {
+                    waypoints[idx].lat = newPos.lat;
+                    waypoints[idx].lon = newPos.lng;
+                    redrawMissionRoute();
+                }
+            });
+
+            marker.on('dragend', function () {
+                notifyWaypointsChanged();
+            });
+
+            waypoints.push({ lat: lat, lon: lon, alt: wpAlt, speed: wpSpd, hover: wpHov, marker: marker });
+            redrawMissionRoute();
+            notifyWaypointsChanged();
+
+            // Smooth pan to newly added waypoint
+            map.panTo([lat, lon]);
+        }
+
+        function loadWaypointsBatch(wpList) {
+            clearMissionWaypoints();
+            if (!wpList || wpList.length === 0) return;
+
+            var bounds = [];
+            wpList.forEach(function (wp) {
+                addWaypoint(wp.lat, wp.lon, wp.alt, wp.speed, wp.hover);
+                bounds.push([wp.lat, wp.lon]);
+            });
+
+            if (bounds.length > 0 && map) {
+                map.fitBounds(bounds, { padding: [50, 50] });
+            }
+        }
+
+        function updateWaypointParams(idx, newAlt, newSpd, newHov) {
+            if (idx >= 0 && idx < waypoints.length) {
+                waypoints[idx].alt = parseFloat(newAlt) || 30.0;
+                waypoints[idx].speed = parseFloat(newSpd) || 5.0;
+                waypoints[idx].hover = parseFloat(newHov) || 0.0;
+                waypoints[idx].marker.bindPopup(`<b>WP #${idx + 1}</b><br>Alt: ${waypoints[idx].alt}m<br>Speed: ${waypoints[idx].speed}m/s<br>Hover: ${waypoints[idx].hover}s`);
+                notifyWaypointsChanged();
+            }
+        }
+
+        function deleteWaypointByIndex(idx) {
+            if (idx >= 0 && idx < waypoints.length) {
+                map.removeLayer(waypoints[idx].marker);
+                waypoints.splice(idx, 1);
+                waypoints.forEach((w, i) => {
+                    var newNum = i + 1;
+                    var newIcon = L.divIcon({
+                        html: `<div class="qgc-wp-pin" id="wp_icon_${newNum}">${newNum}</div>`,
+                        className: '',
+                        iconSize: [26, 26],
+                        iconAnchor: [13, 13]
+                    });
+                    w.marker.setIcon(newIcon);
+                });
+                redrawMissionRoute();
+                notifyWaypointsChanged();
+            }
+        }
+
+        function redrawMissionRoute() {
+            if (missionPolyline) map.removeLayer(missionPolyline);
+            if (returnPolyline) map.removeLayer(returnPolyline);
+
+            var latlngs = [];
+            if (homeMarker) latlngs.push(homeMarker.getLatLng());
+            waypoints.forEach(w => latlngs.push([w.lat, w.lon]));
+
+            if (latlngs.length > 1) {
+                missionPolyline = L.polyline(latlngs, { color: '#facc15', weight: 3, dashArray: '6, 8', opacity: 0.95 }).addTo(map);
+            }
+
+            if (homeMarker && waypoints.length > 0) {
+                var lastWp = waypoints[waypoints.length - 1];
+                returnPolyline = L.polyline([[lastWp.lat, lastWp.lon], homeMarker.getLatLng()], {
+                    color: '#22c55e', weight: 2, dashArray: '4, 6', opacity: 0.8
+                }).addTo(map);
+            }
+        }
+
+        function notifyWaypointsChanged() {
+            var payload = waypoints.map((w, idx) => `${idx + 1}:${w.lat.toFixed(6)}:${w.lon.toFixed(6)}:${w.alt}:${w.speed}:${w.hover}`).join(";");
+            document.title = "WP_SYNC:" + payload;
+        }
+
+        function clearMissionWaypoints() {
+            waypoints.forEach(w => { if (map.hasLayer(w.marker)) map.removeLayer(w.marker); });
+            if (missionPolyline && map.hasLayer(missionPolyline)) map.removeLayer(missionPolyline);
+            if (returnPolyline && map.hasLayer(returnPolyline)) map.removeLayer(returnPolyline);
+            waypoints = [];
+            missionPolyline = null;
+            returnPolyline = null;
+            notifyWaypointsChanged();
+        }
+
+        function updatePosition(lat, lon, heading) {
+            if (!map || !lat || lat === 0.0 || lon === 0.0) return;
+            var pos = [lat, lon];
+            currentHeading = parseFloat(heading) || 0.0;
+
+            if (!droneMarker) {
+                droneMarker = L.marker(pos, { icon: createDroneIcon(currentHeading) }).addTo(map);
+            } else {
+                droneMarker.setLatLng(pos);
+                var rotElem = document.getElementById("uav_rot_disc");
+                if (rotElem) rotElem.style.transform = `rotate(${currentHeading}deg)`;
+            }
+
+            if (!homeMarker) {
+                setHomePosition(lat, lon);
+            }
+
+            if (!hasCenteredOnDrone) {
+                map.setView(pos, 17);
+                hasCenteredOnDrone = true;
+            }
+        }
+
+        function setTargetPosition(lat, lon) {
+            if (!map) return;
+            var pos = [lat, lon];
+            if (targetMarker) map.removeLayer(targetMarker);
+            targetMarker = L.circleMarker(pos, { radius: 7, fillColor: "#10b981", color: "#fff", weight: 2, fillOpacity: 1 }).addTo(map);
+            map.panTo(pos);
+        }
+
+        function setImpactPosition(lat, lon) {
+            if (!map) return;
+            var pos = [lat, lon];
+            if (impactMarker) map.removeLayer(impactMarker);
+            impactMarker = L.circleMarker(pos, { radius: 7, fillColor: "#f97316", color: "#fff", weight: 2, fillOpacity: 1 }).addTo(map);
+        }
+
+        function showInspectPopup(lat, lon, mgrs) {
+            if (!map) return;
+            var marker = L.circleMarker([lat, lon], { radius: 7, fillColor: "#facc15", color: "#ffffff", weight: 2, fillOpacity: 1.0 }).addTo(map);
+            marker.bindPopup(`<b>INSPECT LOCATION</b><br>Lat: ${lat.toFixed(6)}°<br>Lon: ${lon.toFixed(6)}°<br><b>GR: ${mgrs}</b>`).openPopup();
+            plottedInspectMarkers.push(marker);
+        }
+
+        function panAndHighlightLocation(lat, lon, mgrs) {
+            if (!map) return;
+            map.flyTo([lat, lon], 17, { animate: true, duration: 1.0 });
+            showInspectPopup(lat, lon, mgrs);
+        }
+
+        function clearAllPlottedPoints() {
+            plottedInspectMarkers.forEach(m => { if (map.hasLayer(m)) map.removeLayer(m); });
+            plottedInspectMarkers = [];
+        }
+
+        function initMap() {
+            map = L.map('map', { zoomControl: true, attributionControl: false, maxZoom: 22 }).setView([20.5937, 78.9629], 5);
+            map.zoomControl.setPosition('topright');
+
+            L.tileLayer('https://{s}.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', {
+                maxZoom: 22, subdomains: ['mt0', 'mt1', 'mt2', 'mt3']
+            }).addTo(map);
+
+            map.on('click', function (e) {
+                var lat = e.latlng.lat;
+                var lng = e.latlng.lng;
+
+                if (activeMode === "WAYPOINT") {
+                    addWaypoint(lat, lng, currentCruiseAlt, currentCruiseSpeed, defaultHoverSec);
+                } else if (activeMode === "TARGET") {
+                    document.title = "MODE:TARGET," + lat.toFixed(6) + "," + lng.toFixed(6);
+                    activeMode = "NONE";
+                } else if (activeMode === "IMPACT") {
+                    document.title = "MODE:IMPACT," + lat.toFixed(6) + "," + lng.toFixed(6);
+                    activeMode = "NONE";
+                } else {
+                    document.title = "INSPECT:" + lat.toFixed(6) + "," + lng.toFixed(6);
+                }
+            });
+
+            setTimeout(fixMapSize, 200);
+        }
+
+        var ro = new ResizeObserver(function () { fixMapSize(); });
+        ro.observe(document.body);
+        window.addEventListener('load', initMap);
+    </script>
+</body>
+
+</html>
