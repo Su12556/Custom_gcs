@@ -11,8 +11,7 @@ from pymavlink import mavutil
 import serial.tools.list_ports
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QFrame, QLabel, QComboBox, QInputDialog, QLineEdit, QMessageBox,
-    QFileDialog
+    QPushButton, QFrame, QLabel, QComboBox, QMessageBox, QFileDialog
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineSettings
@@ -27,7 +26,7 @@ from core.dooaf_engine import DOOAFEngine
 from core.video_stream import GimbalCameraThread
 from core.dem_manager import DemManager
 from core.mgrs_helper import to_mgrs_gr
-from core.dooaf_report_generator import generate_dooaf_html_report, haversine_dist
+from core.dooaf_report_generator import generate_dooaf_html_report
 from ui.video_widget import ClickableVideoLabel
 from ui.hud_overlay import TacticalOverlayHUD
 from ui.report_dialog import DooafReportDialog
@@ -37,6 +36,7 @@ from ui.target_popup_dialog import TacticalTargetPopup
 from ui.coordinate_goto_dialog import CoordinateGotoDialog
 from ui.flight_plan_widgets import PlanTopStatsBar, PlanLeftToolBar, PlanRightMissionPanel
 from ui.gimbal_control_panel import GimbalControlPanel
+from ui.camera_config_dialog import CameraConfigDialog, CONFIG_FILE
 
 MAIN_STYLE = """
 QPushButton.circle_btn {
@@ -51,73 +51,39 @@ QPushButton.circle_btn {
     max-width: 44px;
     max-height: 44px;
 }
-QPushButton.circle_btn:hover {
-    background-color: #ffffff;
-    border: 2px solid #0284c7;
-}
+QPushButton.circle_btn:hover { background-color: #ffffff; border: 2px solid #0284c7; }
 QFrame#control_bar_panel {
     background: rgba(15, 23, 42, 0.92);
     border: 1px solid #334155;
     border-radius: 6px;
 }
 QPushButton#setup_btn {
-    background-color: #b91c1c;
-    border: 1px solid #dc2626;
-    border-radius: 4px;
-    color: white;
-    font-size: 8.5pt;
-    font-weight: bold;
-    padding: 4px 10px;
-    min-height: 24px;
+    background-color: #b91c1c; border: 1px solid #dc2626; border-radius: 4px;
+    color: white; font-size: 8.5pt; font-weight: bold; padding: 4px 10px; min-height: 24px;
 }
 QPushButton#setup_btn:hover { background-color: #dc2626; }
 QPushButton#plan_mode_btn {
-    background-color: #0284c7;
-    border: 1px solid #38bdf8;
-    border-radius: 4px;
-    color: white;
-    font-size: 8.5pt;
-    font-weight: bold;
-    padding: 4px 10px;
-    min-height: 24px;
+    background-color: #0284c7; border: 1px solid #38bdf8; border-radius: 4px;
+    color: white; font-size: 8.5pt; font-weight: bold; padding: 4px 10px; min-height: 24px;
 }
 QPushButton#plan_mode_btn:hover { background-color: #0369a1; }
 QPushButton#coord_btn {
-    background-color: #0f766e;
-    border: 1px solid #2dd4bf;
-    border-radius: 4px;
-    color: white;
-    font-size: 8.5pt;
-    font-weight: bold;
-    padding: 4px 10px;
-    min-height: 24px;
+    background-color: #0f766e; border: 1px solid #2dd4bf; border-radius: 4px;
+    color: white; font-size: 8.5pt; font-weight: bold; padding: 4px 10px; min-height: 24px;
 }
 QPushButton#coord_btn:hover { background-color: #14b8a6; }
 QComboBox.mav_combo_box {
-    background-color: #0f172a;
-    border: 1px solid #38bdf8;
-    border-radius: 4px;
-    color: #00ffcc;
-    font-family: 'Consolas', monospace;
-    font-size: 9pt;
-    font-weight: bold;
-    padding: 2px 6px;
-    min-height: 24px;
-    max-height: 24px;
+    background-color: #0f172a; border: 1px solid #38bdf8; border-radius: 4px;
+    color: #00ffcc; font-family: 'Consolas', monospace; font-size: 9pt; font-weight: bold;
+    padding: 2px 6px; min-height: 24px; max-height: 24px;
 }
 QComboBox.mav_combo_box QLineEdit {
-    background-color: #0f172a;
-    color: #00ffcc;
-    border: none;
-    font-family: 'Consolas', monospace;
-    font-size: 9pt;
-    font-weight: bold;
+    background-color: #0f172a; color: #00ffcc; border: none;
+    font-family: 'Consolas', monospace; font-size: 9pt; font-weight: bold;
 }
 QComboBox.mav_combo_box::drop-down { border: none; width: 16px; }
 QComboBox.mav_combo_box QAbstractItemView {
-    background-color: #0f172a;
-    color: #ffffff;
-    selection-background-color: #0284c7;
+    background-color: #0f172a; color: #ffffff; selection-background-color: #0284c7;
 }
 """
 
@@ -132,18 +98,26 @@ class VikasFlyViewGCS(QMainWindow):
         default_dem = os.path.abspath(os.path.join(os.path.dirname(__file__), "data", "elevation.tif"))
         self.dem = DemManager(default_dem if os.path.exists(default_dem) else None)
 
-        self.cam_worker = None
-        self.current_rtsp_url = ""
+        # Dual Stream Workers
+        self.cam_worker_day = None
+        self.cam_worker_thermal = None
+        self.day_rtsp_url = ""
+        self.thermal_rtsp_url = ""
+        self.is_showing_thermal = False
+        self.is_split_dual_view = False
+        self._load_cached_camera_urls()
+
         self.mav_worker = None
         self.mission_mgr = None
         self.target_pt = None
         self.impact_pt = None
         self.latest_sol = None
         self.latest_corr = None
+        
+        # Primary view state: True = Map is Fullscreen, False = Video is Fullscreen
         self.map_is_primary = True
         self.custom_udp_conn = "udpin:0.0.0.0:14550"
 
-        # Gimbal orientation tracking (degrees)
         self.gimbal_pitch = -45.0
         self.gimbal_yaw = 0.0
 
@@ -158,14 +132,15 @@ class VikasFlyViewGCS(QMainWindow):
         self.canvas = QWidget(self)
         self.setCentralWidget(self.canvas)
 
-        self.primary_host = QWidget(self.canvas)
-        self.pip_host = QFrame(self.canvas)
-        self.pip_host.setStyleSheet("border: 2px solid #00ffcc; border-radius: 6px; background-color: #000;")
+        # -----------------------------------------------------------------
+        # Primary Component 1: Map View Container
+        # -----------------------------------------------------------------
+        self.map_container = QFrame(self.canvas)
+        self.map_container.setStyleSheet("background-color: #0b0f19; border: none;")
+        map_layout = QVBoxLayout(self.map_container)
+        map_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.video_view = ClickableVideoLabel()
-        self.video_view.pixel_clicked.connect(self.on_video_target_selected)
-
-        self.web_map = QWebEngineView()
+        self.web_map = QWebEngineView(self.map_container)
         self.web_map.setStyleSheet("background-color: #0b0f19;")
         settings = self.web_map.settings()
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
@@ -177,18 +152,47 @@ class VikasFlyViewGCS(QMainWindow):
         self.web_map.load(QUrl.fromLocalFile(map_path))
         self.web_map.titleChanged.connect(self.on_map_event)
         self.web_map.loadFinished.connect(lambda ok: QTimer.singleShot(400, self.safe_fix_map))
+        map_layout.addWidget(self.web_map)
 
-        self.primary_layout = QVBoxLayout(self.primary_host)
-        self.primary_layout.setContentsMargins(0, 0, 0, 0)
-        self.primary_layout.addWidget(self.web_map)
+        # -----------------------------------------------------------------
+        # Primary Component 2: Unified Video Feeds Container
+        # -----------------------------------------------------------------
+        self.video_container = QFrame(self.canvas)
+        self.video_container.setStyleSheet("background-color: #000000; border-radius: 6px;")
+        self.video_layout = QHBoxLayout(self.video_container)
+        self.video_layout.setContentsMargins(0, 0, 0, 0)
+        self.video_layout.setSpacing(2)
 
-        self.pip_layout = QVBoxLayout(self.pip_host)
-        self.pip_layout.setContentsMargins(0, 0, 0, 0)
-        self.pip_layout.addWidget(self.video_view)
+        self.video_view_day = ClickableVideoLabel()
+        self.video_view_day.pixel_clicked.connect(self.on_video_target_selected)
+        self.video_view_day.setText("DAY CAMERA FEED\n[Click 📹 to configure]")
 
-        self.btn_swap_pip = QPushButton("⇄ SWAP", self.pip_host)
-        self.btn_swap_pip.setGeometry(6, 6, 64, 22)
-        self.btn_swap_pip.setStyleSheet("background: rgba(0,0,0,0.85); color: #00ffcc; font-size: 9pt; font-weight: bold; border-radius: 3px;")
+        self.video_view_thermal = ClickableVideoLabel()
+        self.video_view_thermal.pixel_clicked.connect(self.on_video_target_selected)
+        self.video_view_thermal.setText("THERMAL CAMERA FEED\n[Click 📹 to configure]")
+
+        self.video_layout.addWidget(self.video_view_day)
+        self.video_layout.addWidget(self.video_view_thermal)
+        self.video_view_thermal.hide()
+
+        # Floating Swap Button (Always on top of the PIP viewport)
+        self.btn_swap_pip = QPushButton("⇄ SWAP", self.canvas)
+        self.btn_swap_pip.setFixedSize(70, 24)
+        self.btn_swap_pip.setStyleSheet("""
+            QPushButton {
+                background: rgba(15, 23, 42, 0.92);
+                border: 1px solid #00ffcc;
+                border-radius: 4px;
+                color: #00ffcc;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 8.5pt;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: #0284c7;
+                color: #ffffff;
+            }
+        """)
         self.btn_swap_pip.clicked.connect(self.swap_views)
 
         # Top Telemetry Dashboard
@@ -243,7 +247,7 @@ class VikasFlyViewGCS(QMainWindow):
 
         self.hud_overlay = TacticalOverlayHUD(self.canvas)
 
-        # Unified Control Panel (DOOAF + FLIGHT PLAN + PLOT COORD)
+        # Unified Control Panel
         self.unified_control_panel = QFrame(self.canvas)
         self.unified_control_panel.setObjectName("control_bar_panel")
         cp_layout = QHBoxLayout(self.unified_control_panel)
@@ -265,7 +269,7 @@ class VikasFlyViewGCS(QMainWindow):
         self.btn_coord_plot.clicked.connect(self.open_coordinate_dialog)
         cp_layout.addWidget(self.btn_coord_plot)
 
-        # Left Toolbar: Camera & Report
+        # Left Toolbar
         self.left_toolbar = QWidget(self.canvas)
         lt_layout = QVBoxLayout(self.left_toolbar)
         lt_layout.setContentsMargins(0, 0, 0, 0)
@@ -273,8 +277,8 @@ class VikasFlyViewGCS(QMainWindow):
 
         self.btn_cam = QPushButton("📹")
         self.btn_cam.setProperty("class", "circle_btn")
-        self.btn_cam.setToolTip("Toggle Gimbal Feed")
-        self.btn_cam.clicked.connect(self.toggle_camera)
+        self.btn_cam.setToolTip("Camera Feed Stream Setup")
+        self.btn_cam.clicked.connect(self.open_camera_setup)
 
         self.btn_report = QPushButton("📄")
         self.btn_report.setProperty("class", "circle_btn")
@@ -284,15 +288,19 @@ class VikasFlyViewGCS(QMainWindow):
         lt_layout.addWidget(self.btn_cam)
         lt_layout.addWidget(self.btn_report)
 
-        # Gimbal Camera & Video Recording Control Panel (Top-Right Map Placement)
+        # Gimbal Control Panel
         self.gimbal_panel = GimbalControlPanel(self.canvas)
         self.gimbal_panel.gimbal_command.connect(self.handle_gimbal_delta)
         self.gimbal_panel.gimbal_mode_command.connect(self.handle_gimbal_mode)
         self.gimbal_panel.zoom_changed.connect(self.handle_zoom_changed)
         self.gimbal_panel.snapshot_requested.connect(self.handle_snapshot)
         self.gimbal_panel.record_toggled.connect(self.handle_recording_toggled)
+        self.gimbal_panel.ir_toggled.connect(self.handle_thermal_toggle)
+        self.gimbal_panel.dual_view_toggled.connect(self.handle_dual_split_toggle)
+        self.gimbal_panel.camera_config_requested.connect(self.open_camera_setup)
+        self.gimbal_panel.panel_minimized.connect(lambda is_min: self.resizeEvent(None))
 
-        # QGC Flight Plan Panels
+        # Flight Plan Panels
         self.plan_top_bar = PlanTopStatsBar(self.canvas)
         self.plan_top_bar.exit_clicked.connect(self.exit_flight_plan_mode)
         self.plan_top_bar.upload_clicked.connect(self.upload_planned_mission)
@@ -312,6 +320,9 @@ class VikasFlyViewGCS(QMainWindow):
         self.plan_side_panel.hide()
 
         # Dialogs
+        self.camera_dialog = CameraConfigDialog(self)
+        self.camera_dialog.config_saved.connect(self.on_camera_config_applied)
+
         self.setup_dialog = DooafSetupDialog(self)
         self.setup_dialog.pick_requested.connect(self.handle_dialog_pick_request)
         self.setup_dialog.setup_applied.connect(self.handle_setup_applied)
@@ -332,9 +343,160 @@ class VikasFlyViewGCS(QMainWindow):
         self.port_scan_timer.timeout.connect(self.scan_serial_ports)
         self.port_scan_timer.start(1500)
 
-    # -----------------------------------------------------------------
-    # Gimbal & Recording Handlers
-    # -----------------------------------------------------------------
+        if self.day_rtsp_url or self.thermal_rtsp_url:
+            QTimer.singleShot(500, self._start_both_streams)
+
+    # -------------------------------------------------------------
+    # Zero-Reparenting Layout & View Swapping
+    # -------------------------------------------------------------
+    def swap_views(self):
+        """Swaps fullscreen and PIP views cleanly without destroying WebEngine OpenGL surfaces."""
+        self.map_is_primary = not self.map_is_primary
+        self.resizeEvent(None)
+        self.safe_fix_map()
+
+    def resizeEvent(self, event):
+        if event:
+            super().resizeEvent(event)
+        w, h = self.width(), self.height()
+        self.canvas.setGeometry(0, 0, w, h)
+
+        # Calculate PIP Geometry
+        pip_w = 520 if self.is_split_dual_view else 300
+        pip_h = 210
+        pip_x, pip_y = 20, h - (pip_h + 30)
+
+        # Apply geometry based on active primary view
+        if self.map_is_primary:
+            # Map is Fullscreen
+            self.map_container.setGeometry(0, 0, w, h)
+            self.map_container.setStyleSheet("background-color: #0b0f19; border: none;")
+
+            # Video is in PIP
+            self.video_container.setGeometry(pip_x, pip_y, pip_w, pip_h)
+            self.video_container.setStyleSheet("border: 2px solid #00ffcc; border-radius: 6px; background-color: #000;")
+            
+            # Position Swap Button inside the Video PIP box
+            self.btn_swap_pip.setGeometry(pip_x + 8, pip_y + 8, 70, 24)
+
+            # Stack order
+            self.map_container.lower()
+            self.video_container.raise_()
+        else:
+            # Video is Fullscreen
+            self.video_container.setGeometry(0, 0, w, h)
+            self.video_container.setStyleSheet("background-color: #000000; border: none;")
+
+            # Map is in PIP
+            self.map_container.setGeometry(pip_x, pip_y, pip_w, pip_h)
+            self.map_container.setStyleSheet("border: 2px solid #00ffcc; border-radius: 6px; background-color: #0b0f19;")
+            
+            # Position Swap Button inside the Map PIP box
+            self.btn_swap_pip.setGeometry(pip_x + 8, pip_y + 8, 70, 24)
+
+            # Stack order
+            self.video_container.lower()
+            self.map_container.raise_()
+
+        self.btn_swap_pip.raise_()
+        self.hud_overlay.setGeometry(0, 0, w, h)
+        self.hud_overlay.raise_()
+        self.top_dashboard.setGeometry(0, 0, w, 36)
+        self.top_dashboard.raise_()
+
+        # Gimbal Control Panel: Full vs Minimized[cite: 9]
+        if self.gimbal_panel.is_minimized:
+            gimbal_w, gimbal_h = 140, 32
+        else:
+            gimbal_w, gimbal_h = 252, 168
+
+        if self.current_view_mode == "FLY":
+            self.unified_control_panel.setGeometry(10, 44, 340, 36)
+            self.left_toolbar.setGeometry(20, 92, 50, 110)
+            self.gimbal_panel.setGeometry(w - gimbal_w - 20, 46, gimbal_w, gimbal_h)
+            self.unified_control_panel.raise_()
+            self.left_toolbar.raise_()
+        else:
+            self.plan_top_bar.setGeometry(0, 36, w, 46)
+            self.plan_tools.setGeometry(12, 90, 60, 330)
+            self.plan_side_panel.setGeometry(w - 350, 42, 340, h - 50)
+            self.gimbal_panel.setGeometry(w - 350 - gimbal_w - 15, 46, gimbal_w, gimbal_h)
+            self.plan_top_bar.raise_()
+            self.plan_tools.raise_()
+            self.plan_side_panel.raise_()
+
+        self.gimbal_panel.raise_()
+
+    # -------------------------------------------------------------
+    # Dual RTSP Streams Execution
+    # -------------------------------------------------------------
+    def _load_cached_camera_urls(self):
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.day_rtsp_url = data.get("day_url", "")
+                    self.thermal_rtsp_url = data.get("thermal_url", "")
+            except Exception:
+                pass
+
+    def open_camera_setup(self):
+        self.camera_dialog.show()
+        self.camera_dialog.raise_()
+
+    def on_camera_config_applied(self, day_url: str, thermal_url: str):
+        self.day_rtsp_url = day_url
+        self.thermal_rtsp_url = thermal_url
+        self._start_both_streams()
+
+    def _start_both_streams(self):
+        if self.day_rtsp_url:
+            if self.cam_worker_day:
+                self.cam_worker_day.stop()
+            self.cam_worker_day = GimbalCameraThread(source=self.day_rtsp_url, parent=self)
+            self.cam_worker_day.frame_received.connect(self.video_view_day.update_frame)
+            self.cam_worker_day.start()
+
+        if self.thermal_rtsp_url:
+            if self.cam_worker_thermal:
+                self.cam_worker_thermal.stop()
+            self.cam_worker_thermal = GimbalCameraThread(source=self.thermal_rtsp_url, parent=self)
+            self.cam_worker_thermal.frame_received.connect(self.video_view_thermal.update_frame)
+            self.cam_worker_thermal.start()
+
+        self.btn_cam.setStyleSheet("border: 2px solid #00ffcc; background: #0369a1; color: white;")
+        self.lbl_veh_msg.setText("MSG: DUAL STREAMS (DAY + THERMAL) ACTIVE")
+        self._refresh_video_display_layout()
+
+    def handle_thermal_toggle(self, use_thermal: bool):
+        self.is_showing_thermal = use_thermal
+        self.is_split_dual_view = False
+        self._refresh_video_display_layout()
+        feed_name = "THERMAL (IR)" if use_thermal else "DAY (EO)"
+        self.lbl_veh_msg.setText(f"MSG: ACTIVE CAMERA VIEW: {feed_name}")
+
+    def handle_dual_split_toggle(self):
+        self.is_split_dual_view = not self.is_split_dual_view
+        self._refresh_video_display_layout()
+        status_s = "SPLIT DUAL VIEW (DAY + THERMAL)" if self.is_split_dual_view else "SINGLE FEED VIEW"
+        self.lbl_veh_msg.setText(f"MSG: {status_s}")
+
+    def _refresh_video_display_layout(self):
+        if self.is_split_dual_view:
+            self.video_view_day.show()
+            self.video_view_thermal.show()
+        else:
+            if self.is_showing_thermal:
+                self.video_view_day.hide()
+                self.video_view_thermal.show()
+            else:
+                self.video_view_day.show()
+                self.video_view_thermal.hide()
+        self.resizeEvent(None)
+
+    # -------------------------------------------------------------
+    # Gimbal Mount & Recording Handlers
+    # -------------------------------------------------------------
     def handle_gimbal_delta(self, pitch_delta: float, yaw_delta: float):
         self.gimbal_pitch = max(-90.0, min(20.0, self.gimbal_pitch + pitch_delta))
         self.gimbal_yaw = (self.gimbal_yaw + yaw_delta) % 360.0
@@ -364,57 +526,56 @@ class VikasFlyViewGCS(QMainWindow):
             self.lbl_veh_msg.setText(f"MSG: GIMBAL PITCH {pitch:.0f}° | YAW {yaw:.0f}°")
 
     def handle_zoom_changed(self, zoom: float):
-        if self.cam_worker:
-            self.cam_worker.set_zoom(zoom)
+        if self.cam_worker_day: self.cam_worker_day.set_zoom(zoom)
+        if self.cam_worker_thermal: self.cam_worker_thermal.set_zoom(zoom)
 
     def handle_snapshot(self):
-        if self.cam_worker and self.cam_worker.isRunning():
-            self.cam_worker.trigger_snapshot()
-            self.lbl_veh_msg.setText("MSG: SNAPSHOT CAPTURED TO /snapshots")
+        worker = self.cam_worker_thermal if self.is_showing_thermal else self.cam_worker_day
+        if worker and worker.isRunning():
+            worker.trigger_snapshot()
+            self.lbl_veh_msg.setText("MSG: SNAPSHOT SAVED TO /snapshots")
         else:
-            QMessageBox.information(self, "Camera Inactive", "Start gimbal camera feed to capture snapshot.")
+            QMessageBox.information(self, "Stream Inactive", "Camera stream not active.")
+
     def handle_recording_toggled(self, is_recording: bool):
+        worker = self.cam_worker_thermal if self.is_showing_thermal else self.cam_worker_day
         if is_recording:
-            if self.cam_worker and self.cam_worker.isRunning():
-                self.cam_worker.start_recording("recordings")
-                self.lbl_veh_msg.setText("MSG: 🔴 RECORDING VIDEO FEED...")
+            if worker and worker.isRunning():
+                worker.start_recording("recordings")
+                self.lbl_veh_msg.setText("MSG: 🔴 RECORDING STREAM...")
             else:
-                QMessageBox.warning(self, "No Video Feed", "Connect camera feed first to record.")
+                QMessageBox.warning(self, "No Active Stream", "Configure and start camera stream first.")
                 self.gimbal_panel.toggle_recording()
         else:
-            if self.cam_worker:
-                saved_path = getattr(self.cam_worker, "record_filename", None)
-                self.cam_worker.stop_recording()
+            if worker:
+                worker.stop_recording()
                 self.lbl_veh_msg.setText("MSG: VIDEO RECORDING SAVED TO /recordings")
 
-                # Optional: Automatically open Windows File Explorer to the saved file
-                if saved_path and os.path.exists(saved_path):
-                    import subprocess
-                    subprocess.Popen(f'explorer /select,"{os.path.abspath(saved_path)}"')
     def open_coordinate_dialog(self):
         is_plan = (self.current_view_mode == "PLAN")
         self.goto_dialog.set_mode_hint(is_plan)
         self.goto_dialog.show()
         self.goto_dialog.raise_()
 
-    def handle_unified_coordinate_input(self, lat: float, lon: float, coord_str: str, alt: float):
+    def handle_unified_coordinate_input(self, lat: float, lon: float, coord_str: str):
         if not self.map_is_primary:
             self.swap_views()
 
         if self.current_view_mode == "PLAN":
+            # Default mission cruise parameters applied automatically behind the scenes
+            default_alt = 30.0
             speed = 5.0
             hover = 0.0
             self.web_map.page().runJavaScript(
-                f"if (typeof addWaypoint === 'function') {{{{ addWaypoint({lat}, {lon}, {alt}, {speed}, {hover}); }}}}"
+                f"if (typeof addWaypoint === 'function') {{ addWaypoint({lat}, {lon}, {default_alt}, {speed}, {hover}); }}"
             )
             self.lbl_veh_msg.setText(f"MSG: ADDED WAYPOINT AT {lat:.6f}, {lon:.6f}")
         else:
             mgrs_val = to_mgrs_gr(lat, lon)
             self.web_map.page().runJavaScript(
-                f"if (typeof panAndHighlightLocation === 'function') {{{{ panAndHighlightLocation({lat}, {lon}, '{mgrs_val}'); }}}}"
+                f"if (typeof panAndHighlightLocation === 'function') {{ panAndHighlightLocation({lat}, {lon}, '{mgrs_val}'); }}"
             )
             self.lbl_veh_msg.setText(f"MSG: PLOTTED LOCATION -> {mgrs_val}")
-
     def enter_flight_plan_mode(self):
         self.current_view_mode = "PLAN"
         if not self.map_is_primary:
@@ -585,37 +746,29 @@ class VikasFlyViewGCS(QMainWindow):
             return
 
         file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save Flight Plan",
-            os.path.expanduser("~/Documents/mission.plan"),
+            self, "Save Flight Plan", os.path.expanduser("~/Documents/mission.plan"),
             "QGC Plan Files (*.plan);;JSON Mission Files (*.json);;All Files (*.*)"
         )
         if not file_path: return
 
         try:
             plan_data = {
-                "fileType": "Plan",
-                "version": 1,
-                "groundStation": "VIKAS GCS",
+                "fileType": "Plan", "version": 1, "groundStation": "VIKAS GCS",
                 "mission": {
-                    "cruiseSpeed": 5.0,
-                    "hoverDelayDefault": 0.0,
+                    "cruiseSpeed": 5.0, "hoverDelayDefault": 0.0,
                     "finishAction": self.plan_side_panel.get_selected_finish_action(),
                     "items": self.planned_waypoints
                 }
             }
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(plan_data, f, indent=4)
-
             QMessageBox.information(self, "Plan Saved", f"Mission saved to:\n{os.path.basename(file_path)}")
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"Failed to save plan:\n{e}")
 
     def open_mission_from_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open Flight Plan",
-            os.path.expanduser("~/Documents"),
+            self, "Open Flight Plan", os.path.expanduser("~/Documents"),
             "Mission Files (*.plan *.json);;All Files (*.*)"
         )
         if not file_path or not os.path.exists(file_path): return
@@ -631,19 +784,15 @@ class VikasFlyViewGCS(QMainWindow):
                 finish_act = data["mission"].get("finishAction", "RTL")
                 for itm in data["mission"]["items"]:
                     waypoints_loaded.append({
-                        "lat": float(itm.get("lat")),
-                        "lon": float(itm.get("lon")),
-                        "alt": float(itm.get("alt", 30.0)),
-                        "speed": float(itm.get("speed", 5.0)),
+                        "lat": float(itm.get("lat")), "lon": float(itm.get("lon")),
+                        "alt": float(itm.get("alt", 30.0)), "speed": float(itm.get("speed", 5.0)),
                         "hover": float(itm.get("hover", 0.0))
                     })
             elif isinstance(data, list):
                 for itm in data:
                     waypoints_loaded.append({
-                        "lat": float(itm["lat"]),
-                        "lon": float(itm["lon"]),
-                        "alt": float(itm.get("alt", 30.0)),
-                        "speed": float(itm.get("speed", 5.0)),
+                        "lat": float(itm["lat"]), "lon": float(itm["lon"]),
+                        "alt": float(itm.get("alt", 30.0)), "speed": float(itm.get("speed", 5.0)),
                         "hover": float(itm.get("hover", 0.0))
                     })
 
@@ -663,7 +812,6 @@ class VikasFlyViewGCS(QMainWindow):
             home_lat = self.hud_overlay.telem.get("lat")
             home_lon = self.hud_overlay.telem.get("lon")
             self.plan_top_bar.update_stats(self.planned_waypoints, home_lat, home_lon)
-
             QMessageBox.information(self, "Plan Loaded", f"Loaded {len(waypoints_loaded)} waypoints.")
         except Exception as e:
             QMessageBox.critical(self, "Load Error", f"Failed to load plan:\n{e}")
@@ -753,8 +901,7 @@ class VikasFlyViewGCS(QMainWindow):
         if self.mission_execution_state == "IDLE":
             if not self.mission_mgr.is_drone_armed():
                 reply = QMessageBox.warning(
-                    self,
-                    "Drone Not Armed",
+                    self, "Drone Not Armed",
                     "Drone is not Armed!\n\nPlease arm the drone to start autonomous flight.\n\n"
                     "Would you like to send the ARM command now?",
                     QMessageBox.Yes | QMessageBox.No
@@ -794,70 +941,6 @@ class VikasFlyViewGCS(QMainWindow):
         success = self.dem.load_dem(file_path)
         self.setup_dialog.set_dem_status(os.path.basename(file_path), success)
 
-    def resizeEvent(self, event):
-        if event:
-            super().resizeEvent(event)
-        w, h = self.width(), self.height()
-        self.canvas.setGeometry(0, 0, w, h)
-        self.primary_host.setGeometry(0, 0, w, h)
-
-        self.top_dashboard.setGeometry(0, 0, w, 36)
-        self.hud_overlay.setGeometry(0, 0, w, h)
-
-        # Bottom Left: PIP Video Window
-        pip_w, pip_h = 280, 200
-        pip_x, pip_y = 20, h - (pip_h + 30)
-        self.pip_host.setGeometry(pip_x, pip_y, pip_w, pip_h)
-
-        # Top-Right Corner Gimbal Control Panel:
-        gimbal_w = 240
-        gimbal_h = 36 if self.gimbal_panel.is_minimized else 160
-
-        if self.current_view_mode == "FLY":
-            self.unified_control_panel.setGeometry(10, 44, 340, 36)
-            self.left_toolbar.setGeometry(20, 92, 50, 110)
-            # Anchored at top-right corner
-            self.gimbal_panel.setGeometry(w - gimbal_w - 20, 46, gimbal_w, gimbal_h)
-        else:
-            self.plan_top_bar.setGeometry(0, 36, w, 46)
-            self.plan_tools.setGeometry(12, 90, 60, 330)
-            self.plan_side_panel.setGeometry(w - 350, 42, 340, h - 50)
-            # In Plan Mode, place immediately to the left of the Mission Settings panel
-            self.gimbal_panel.setGeometry(w - 350 - gimbal_w - 15, 46, gimbal_w, gimbal_h)
-
-        self.primary_host.lower()
-        self.hud_overlay.raise_()
-        self.top_dashboard.raise_()
-        self.pip_host.raise_()
-        self.btn_swap_pip.raise_()
-        self.gimbal_panel.raise_()
-
-        if self.current_view_mode == "FLY":
-            self.unified_control_panel.raise_()
-            self.left_toolbar.raise_()
-        else:
-            self.plan_top_bar.raise_()
-            self.plan_tools.raise_()
-            self.plan_side_panel.raise_()
-
-        self.safe_fix_map()
-
-    def swap_views(self):
-        self.primary_layout.removeWidget(self.web_map if self.map_is_primary else self.video_view)
-        self.pip_layout.removeWidget(self.video_view if self.map_is_primary else self.web_map)
-
-        if self.map_is_primary:
-            self.primary_layout.addWidget(self.video_view)
-            self.pip_layout.addWidget(self.web_map)
-            self.map_is_primary = False
-        else:
-            self.primary_layout.addWidget(self.web_map)
-            self.pip_layout.addWidget(self.video_view)
-            self.map_is_primary = True
-
-        self.btn_swap_pip.raise_()
-        self.safe_fix_map()
-
     def open_dooaf_setup(self):
         self.setup_dialog.show()
 
@@ -874,7 +957,7 @@ class VikasFlyViewGCS(QMainWindow):
         elif source_type == "VIDEO":
             if self.map_is_primary:
                 self.swap_views()
-            self.video_view.set_selection_mode(True, entity=entity_type)
+            self.video_view_day.set_selection_mode(True, entity=entity_type)
 
     def on_video_target_selected(self, px, py, w, h):
         t = self.hud_overlay.telem
@@ -963,24 +1046,10 @@ class VikasFlyViewGCS(QMainWindow):
         if hasattr(self, 'web_map') and self.web_map:
             self.web_map.page().runJavaScript("if (typeof fixMapSize === 'function') { fixMapSize(); }")
 
-    def toggle_camera(self):
-        if self.cam_worker:
-            self.cam_worker.stop()
-            self.cam_worker = None
-            self.btn_cam.setStyleSheet("")
-            self.video_view.setText("NO GIMBAL CAMERA FEED\n[Click 📹 on Left Toolbar]")
-        else:
-            url, ok = QInputDialog.getText(self, "Gimbal Camera Setup", "Enter RTSP URL:", QLineEdit.Normal, self.current_rtsp_url)
-            if ok and url.strip():
-                self.current_rtsp_url = url.strip()
-                self.btn_cam.setStyleSheet("border: 2px solid #00ffcc; background: #0369a1; color: white;")
-                self.cam_worker = GimbalCameraThread(source=self.current_rtsp_url, parent=self)
-                self.cam_worker.frame_received.connect(self.video_view.update_frame)
-                self.cam_worker.start()
-
     def closeEvent(self, event):
         self.port_scan_timer.stop()
-        if self.cam_worker: self.cam_worker.stop()
+        if self.cam_worker_day: self.cam_worker_day.stop()
+        if self.cam_worker_thermal: self.cam_worker_thermal.stop()
         if self.mav_worker: self.mav_worker.stop()
         if self.dem: self.dem.close()
         event.accept()

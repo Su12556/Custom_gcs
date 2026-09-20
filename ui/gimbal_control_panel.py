@@ -3,7 +3,6 @@ from PySide6.QtWidgets import (
     QLabel, QWidget
 )
 from PySide6.QtCore import Qt, Signal, QTimer
-from PySide6.QtGui import QFont
 
 GIMBAL_PANEL_STYLE = """
 QFrame#gimbal_root {
@@ -19,7 +18,7 @@ QPushButton.g_top_btn {
     font-size: 8.5pt;
     font-weight: bold;
     min-width: 28px;
-    max-width: 32px;
+    max-width: 30px;
     min-height: 26px;
     max-height: 26px;
 }
@@ -28,10 +27,15 @@ QPushButton.g_top_btn:hover {
     border-color: #38bdf8;
     color: #ffffff;
 }
-QPushButton#btn_track_active {
-    background: #064e3b;
-    border: 1.5px solid #10b981;
-    color: #34d399;
+QPushButton#btn_ir_active {
+    background: #b45309;
+    border: 1.5px solid #f59e0b;
+    color: #ffffff;
+}
+QPushButton#btn_dual_active {
+    background: #0369a1;
+    border: 1.5px solid #38bdf8;
+    color: #ffffff;
 }
 QPushButton.g_pad_btn {
     background: #0f172a;
@@ -59,9 +63,7 @@ QPushButton.g_rec_btn {
     min-height: 26px;
     max-height: 26px;
 }
-QPushButton.g_rec_btn:hover {
-    border-color: #ef4444;
-}
+QPushButton.g_rec_btn:hover { border-color: #ef4444; }
 QLabel#lbl_rec_timer {
     background: #dc2626;
     color: #ffffff;
@@ -69,52 +71,77 @@ QLabel#lbl_rec_timer {
     font-size: 9pt;
     font-weight: bold;
     border-radius: 4px;
-    padding: 3px 12px;
+    padding: 3px 8px;
 }
 QLabel.section_lbl {
     color: #94a3b8;
     font-size: 7.5pt;
     font-weight: 800;
 }
+QPushButton#btn_floating_restore {
+    background-color: #0284c7;
+    border: 1px solid #38bdf8;
+    color: white;
+    font-size: 9pt;
+    font-weight: bold;
+    border-radius: 6px;
+}
+QPushButton#btn_floating_restore:hover { background-color: #0369a1; }
 """
 
 class GimbalControlPanel(QFrame):
-    # Gimbal movement signals: pitch_delta, yaw_delta
     gimbal_command = Signal(float, float)
-    gimbal_mode_command = Signal(str)  # "HOME", "NADIR_90"
+    gimbal_mode_command = Signal(str)
     zoom_changed = Signal(float)
     snapshot_requested = Signal()
     record_toggled = Signal(bool)
+    ir_toggled = Signal(bool)
+    dual_view_toggled = Signal()
+    camera_config_requested = Signal()
+    panel_minimized = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("gimbal_root")
         self.setStyleSheet(GIMBAL_PANEL_STYLE)
-        self.setFixedWidth(240)
 
         self.is_minimized = False
         self.is_recording = False
+        self.is_thermal_active = False
         self.record_seconds = 0
         self.current_zoom = 1.0
 
-        # Recording stopwatch timer
         self.rec_timer = QTimer(self)
         self.rec_timer.setInterval(1000)
         self.rec_timer.timeout.connect(self._update_rec_timer)
 
-        self.main_layout = QVBoxLayout(self)
-        self.main_layout.setContentsMargins(8, 8, 8, 8)
+        self.outer_layout = QVBoxLayout(self)
+        self.outer_layout.setContentsMargins(0, 0, 0, 0)
+        self.outer_layout.setSpacing(0)
+
+        # 1. Floating Minimized Pill Button
+        self.btn_restore = QPushButton("📹 Gimbal Controls ‹", self)
+        self.btn_restore.setObjectName("btn_floating_restore")
+        self.btn_restore.setFixedSize(140, 32)
+        self.btn_restore.clicked.connect(self.toggle_minimize)
+        self.btn_restore.hide()
+        self.outer_layout.addWidget(self.btn_restore)
+
+        # 2. Main Full Panel Widget
+        self.full_panel_widget = QWidget(self)
+        self.main_layout = QVBoxLayout(self.full_panel_widget)
+        self.main_layout.setContentsMargins(6, 6, 6, 6)
         self.main_layout.setSpacing(6)
 
-        # -------------------------------------------------------------
-        # Row 1: Camera Header Controls
-        # -------------------------------------------------------------
+        # Header Row
         top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
         top_row.setSpacing(4)
 
         self.btn_cam_mode = QPushButton("📹")
         self.btn_cam_mode.setProperty("class", "g_top_btn")
-        self.btn_cam_mode.setToolTip("Camera Video Mode")
+        self.btn_cam_mode.setToolTip("Configure Dual Camera RTSP Streams (Day & Thermal)")
+        self.btn_cam_mode.clicked.connect(self.camera_config_requested.emit)
         top_row.addWidget(self.btn_cam_mode)
 
         self.btn_snap = QPushButton("📷")
@@ -123,44 +150,47 @@ class GimbalControlPanel(QFrame):
         self.btn_snap.clicked.connect(self.snapshot_requested.emit)
         top_row.addWidget(self.btn_snap)
 
+        # Grid Button = Toggle Dual Stream Split-Screen View
         self.btn_grid = QPushButton("⊞")
         self.btn_grid.setProperty("class", "g_top_btn")
-        self.btn_grid.setToolTip("Toggle Crosshair / Grid")
+        self.btn_grid.setToolTip("Toggle Day + Thermal Dual Split Screen")
+        self.btn_grid.clicked.connect(self.dual_view_toggled.emit)
         top_row.addWidget(self.btn_grid)
 
+        # IR / Thermal Button
         self.btn_ir = QPushButton("IR")
         self.btn_ir.setProperty("class", "g_top_btn")
-        self.btn_ir.setToolTip("IR / Thermal Palette")
+        self.btn_ir.setToolTip("Switch Primary View between Day and Thermal (IR)")
+        self.btn_ir.clicked.connect(self._toggle_ir_mode)
         top_row.addWidget(self.btn_ir)
 
         self.btn_track = QPushButton("🎯")
         self.btn_track.setProperty("class", "g_top_btn")
-        self.btn_track.setObjectName("btn_track_active")
         self.btn_track.setToolTip("Target Tracking Lock")
         top_row.addWidget(self.btn_track)
 
         self.lbl_zoom = QLabel("1.0x")
-        self.lbl_zoom.setStyleSheet("background: #0f172a; border: 1px solid #1e293b; color: #cbd5e1; font-family: Consolas; font-size: 8pt; padding: 2px 4px; border-radius: 3px;")
+        self.lbl_zoom.setAlignment(Qt.AlignCenter)
+        self.lbl_zoom.setFixedWidth(36)
+        self.lbl_zoom.setStyleSheet("background: #0f172a; border: 1px solid #1e293b; color: #cbd5e1; font-family: Consolas; font-size: 8pt; border-radius: 3px; padding: 2px 0px;")
         top_row.addWidget(self.lbl_zoom)
 
-        # Minimize Toggle Button (chevron)
+        # Minimize Button -> Collapses panel into the small pill
         self.btn_minimize = QPushButton("›")
         self.btn_minimize.setProperty("class", "g_top_btn")
-        self.btn_minimize.setToolTip("Minimize / Expand Gimbal Panel")
+        self.btn_minimize.setToolTip("Collapse Control Panel Completely")
         self.btn_minimize.clicked.connect(self.toggle_minimize)
         top_row.addWidget(self.btn_minimize)
 
         self.main_layout.addLayout(top_row)
 
-        # -------------------------------------------------------------
-        # Expandable Body Container
-        # -------------------------------------------------------------
-        self.body_widget = QWidget(self)
+        # Body Container
+        self.body_widget = QWidget(self.full_panel_widget)
         body_layout = QVBoxLayout(self.body_widget)
         body_layout.setContentsMargins(0, 0, 0, 0)
         body_layout.setSpacing(6)
 
-        # Row 2: Video Recording Row
+        # Video Recording Row
         rec_row = QHBoxLayout()
         rec_row.setSpacing(8)
 
@@ -178,12 +208,11 @@ class GimbalControlPanel(QFrame):
 
         body_layout.addLayout(rec_row)
 
-        # Divider line
         div = QFrame()
         div.setStyleSheet("background: #1e293b; max-height: 1px;")
         body_layout.addWidget(div)
 
-        # Row 3: Lens Zoom & Focus Controls
+        # Lens Zoom & Focus Controls
         lens_layout = QHBoxLayout()
         lens_layout.setSpacing(4)
 
@@ -219,7 +248,7 @@ class GimbalControlPanel(QFrame):
 
         body_layout.addLayout(lens_layout)
 
-        # Row 4: Gimbal Directional Numpad[cite: 15]
+        # Gimbal Directional Numpad
         gimbal_wrap = QHBoxLayout()
         gimbal_wrap.setSpacing(6)
 
@@ -247,7 +276,7 @@ class GimbalControlPanel(QFrame):
 
         self.btn_home = QPushButton("⌂")
         self.btn_home.setProperty("class", "g_pad_btn")
-        self.btn_home.setToolTip("Recenter Gimbal Forward (0° pitch, 0° yaw)")
+        self.btn_home.setToolTip("Recenter Gimbal (0° Pitch, 0° Yaw)")
         self.btn_home.clicked.connect(lambda: self.gimbal_mode_command.emit("HOME"))
         pad_grid.addWidget(self.btn_home, 1, 0)
 
@@ -266,17 +295,27 @@ class GimbalControlPanel(QFrame):
         body_layout.addLayout(gimbal_wrap)
 
         self.main_layout.addWidget(self.body_widget)
+        self.outer_layout.addWidget(self.full_panel_widget)
+
+    def _toggle_ir_mode(self):
+        self.is_thermal_active = not self.is_thermal_active
+        if self.is_thermal_active:
+            self.btn_ir.setStyleSheet("background: #b45309; border: 1.5px solid #f59e0b; color: #ffffff;")
+        else:
+            self.btn_ir.setStyleSheet("")
+        self.ir_toggled.emit(self.is_thermal_active)
 
     def toggle_minimize(self):
         self.is_minimized = not self.is_minimized
         if self.is_minimized:
-            self.body_widget.hide()
-            self.btn_minimize.setText("‹")
-            self.adjustSize()
+            self.full_panel_widget.hide()
+            self.btn_restore.show()
+            self.setStyleSheet("background: transparent; border: none;")
         else:
-            self.body_widget.show()
-            self.btn_minimize.setText("›")
-            self.adjustSize()
+            self.btn_restore.hide()
+            self.full_panel_widget.show()
+            self.setStyleSheet(GIMBAL_PANEL_STYLE)
+        self.panel_minimized.emit(self.is_minimized)
 
     def toggle_recording(self):
         self.is_recording = not self.is_recording

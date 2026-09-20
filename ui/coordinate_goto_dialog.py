@@ -1,16 +1,16 @@
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, 
-    QPushButton, QRadioButton, QButtonGroup, QMessageBox
+    QPushButton, QMessageBox
 )
 from PySide6.QtCore import Qt, Signal
 
 class CoordinateGotoDialog(QDialog):
-    coordinate_selected = Signal(float, float, str, float)  # lat, lon, mgrs_str, alt
+    coordinate_selected = Signal(float, float, str)  # lat, lon, coord_str
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Plot Location / Waypoint Coordinate")
-        self.setFixedSize(380, 240)
+        self.setFixedSize(380, 200)
         self.setStyleSheet("""
             QDialog {
                 background-color: #0b1118;
@@ -89,16 +89,6 @@ class CoordinateGotoDialog(QDialog):
         row2.addWidget(self.txt_lon)
         layout.addLayout(row2)
 
-        # Altitude Input (for waypoints)
-        row3 = QHBoxLayout()
-        lbl_alt = QLabel("Altitude (m):")
-        lbl_alt.setFixedWidth(65)
-        self.txt_alt = QLineEdit("30.0")
-        self.txt_alt.setPlaceholderText("Altitude in meters")
-        row3.addWidget(lbl_alt)
-        row3.addWidget(self.txt_alt)
-        layout.addLayout(row3)
-
         layout.addSpacing(6)
 
         # Action Buttons
@@ -126,12 +116,10 @@ class CoordinateGotoDialog(QDialog):
     def process_coordinate(self):
         lat_s = self.txt_lat.text().strip()
         lon_s = self.txt_lon.text().strip()
-        alt_s = self.txt_alt.text().strip()
 
         try:
             lat = float(lat_s)
             lon = float(lon_s)
-            alt = float(alt_s) if alt_s else 30.0
         except ValueError:
             QMessageBox.warning(self, "Invalid Input", "Please enter valid numeric values for Latitude and Longitude.")
             return
@@ -140,5 +128,5 @@ class CoordinateGotoDialog(QDialog):
             QMessageBox.warning(self, "Out of Range", "Latitude must be between -90 and 90. Longitude between -180 and 180.")
             return
 
-        self.coordinate_selected.emit(lat, lon, f"{lat:.6f}, {lon:.6f}", alt)
+        self.coordinate_selected.emit(lat, lon, f"{lat:.6f}, {lon:.6f}")
         self.accept()

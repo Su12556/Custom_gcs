@@ -31,26 +31,34 @@
             filter: brightness(1.0) contrast(1.05);
         }
 
-        .leaflet-top.leaflet-right {
-            top: 8px !important;
-            right: 8px !important;
+        /* Shift Leaflet zoom control cleanly to bottom-right corner */
+        .leaflet-bottom.leaflet-right {
+            bottom: 20px !important;
+            right: 20px !important;
         }
 
         .leaflet-bar {
-            border: 1px solid #facc15 !important;
-            box-shadow: 0 0 8px rgba(250, 204, 21, 0.4) !important;
+            border: 1px solid #38bdf8 !important;
+            box-shadow: 0 0 10px rgba(2, 132, 199, 0.4) !important;
+            border-radius: 4px !important;
+            overflow: hidden;
         }
 
         .leaflet-bar a {
-            width: 26px !important;
-            height: 26px !important;
-            line-height: 24px !important;
+            width: 28px !important;
+            height: 28px !important;
+            line-height: 28px !important;
             font-size: 16px !important;
             font-weight: bold !important;
             background-color: rgba(15, 23, 42, 0.95) !important;
-            color: #facc15 !important;
+            color: #38bdf8 !important;
             border-bottom: 1px solid #334155 !important;
             text-align: center !important;
+        }
+
+        .leaflet-bar a:hover {
+            background-color: #0284c7 !important;
+            color: #ffffff !important;
         }
 
         .uav-base-wrap {
@@ -113,24 +121,17 @@
     <div id="map"></div>
     <script>
         var map = null;
-        var droneMarker = null, gunMarker = null, homeMarker = null;
-        var targetMarker = null, impactMarker = null;
+        var droneMarker = null, homeMarker = null, targetMarker = null, impactMarker = null;
         var activeMode = "NONE";
         var currentHeading = 0.0;
         var hasCenteredOnDrone = false;
 
         var waypoints = [];
-        var missionPolyline = null;
-        var returnPolyline = null;
-        var currentCruiseAlt = 30.0;
-        var currentCruiseSpeed = 5.0;
-        var defaultHoverSec = 0.0;
+        var missionPolyline = null, returnPolyline = null;
+        var currentCruiseAlt = 30.0, currentCruiseSpeed = 5.0, defaultHoverSec = 0.0;
         var plottedInspectMarkers = [];
 
-        function fixMapSize() {
-            if (map) { map.invalidateSize(true); }
-        }
-
+        function fixMapSize() { if (map) { map.invalidateSize(true); } }
         function setSelectionMode(mode) { activeMode = mode; }
         function setCruiseAltitude(alt) { currentCruiseAlt = parseFloat(alt) || 30.0; }
 
@@ -177,9 +178,7 @@
 
             var wpIcon = L.divIcon({
                 html: `<div class="qgc-wp-pin" id="wp_icon_${wpNum}">${wpNum}</div>`,
-                className: '',
-                iconSize: [26, 26],
-                iconAnchor: [13, 13]
+                className: '', iconSize: [26, 26], iconAnchor: [13, 13]
             });
 
             var marker = L.marker([lat, lon], { icon: wpIcon, draggable: true }).addTo(map);
@@ -195,31 +194,23 @@
                 }
             });
 
-            marker.on('dragend', function () {
-                notifyWaypointsChanged();
-            });
+            marker.on('dragend', function () { notifyWaypointsChanged(); });
 
             waypoints.push({ lat: lat, lon: lon, alt: wpAlt, speed: wpSpd, hover: wpHov, marker: marker });
             redrawMissionRoute();
             notifyWaypointsChanged();
-
-            // Smooth pan to newly added waypoint
             map.panTo([lat, lon]);
         }
 
         function loadWaypointsBatch(wpList) {
             clearMissionWaypoints();
             if (!wpList || wpList.length === 0) return;
-
             var bounds = [];
             wpList.forEach(function (wp) {
                 addWaypoint(wp.lat, wp.lon, wp.alt, wp.speed, wp.hover);
                 bounds.push([wp.lat, wp.lon]);
             });
-
-            if (bounds.length > 0 && map) {
-                map.fitBounds(bounds, { padding: [50, 50] });
-            }
+            if (bounds.length > 0 && map) { map.fitBounds(bounds, { padding: [50, 50] }); }
         }
 
         function updateWaypointParams(idx, newAlt, newSpd, newHov) {
@@ -240,9 +231,7 @@
                     var newNum = i + 1;
                     var newIcon = L.divIcon({
                         html: `<div class="qgc-wp-pin" id="wp_icon_${newNum}">${newNum}</div>`,
-                        className: '',
-                        iconSize: [26, 26],
-                        iconAnchor: [13, 13]
+                        className: '', iconSize: [26, 26], iconAnchor: [13, 13]
                     });
                     w.marker.setIcon(newIcon);
                 });
@@ -299,14 +288,8 @@
                 if (rotElem) rotElem.style.transform = `rotate(${currentHeading}deg)`;
             }
 
-            if (!homeMarker) {
-                setHomePosition(lat, lon);
-            }
-
-            if (!hasCenteredOnDrone) {
-                map.setView(pos, 17);
-                hasCenteredOnDrone = true;
-            }
+            if (!homeMarker) { setHomePosition(lat, lon); }
+            if (!hasCenteredOnDrone) { map.setView(pos, 17); hasCenteredOnDrone = true; }
         }
 
         function setTargetPosition(lat, lon) {
@@ -337,14 +320,10 @@
             showInspectPopup(lat, lon, mgrs);
         }
 
-        function clearAllPlottedPoints() {
-            plottedInspectMarkers.forEach(m => { if (map.hasLayer(m)) map.removeLayer(m); });
-            plottedInspectMarkers = [];
-        }
-
         function initMap() {
-            map = L.map('map', { zoomControl: true, attributionControl: false, maxZoom: 22 }).setView([20.5937, 78.9629], 5);
-            map.zoomControl.setPosition('topright');
+            // Position zoom controls cleanly at bottom-right
+            map = L.map('map', { zoomControl: false, attributionControl: false, maxZoom: 22 }).setView([20.5937, 78.9629], 5);
+            L.control.zoom({ position: 'bottomright' }).addTo(map);
 
             L.tileLayer('https://{s}.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', {
                 maxZoom: 22, subdomains: ['mt0', 'mt1', 'mt2', 'mt3']
