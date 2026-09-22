@@ -1,9 +1,11 @@
 import os
 import sys
 import json
+import shutil
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-    "rtsp_transport;tcp|fflags;nobuffer|max_delay;500000|stimeout;5000000"
+    "rtsp_transport;tcp|fflags;nobuffer+discardcorrupt|flags;low_delay|"
+    "max_delay;250000|stimeout;3000000|timeout;3000000"
 )
 
 from datetime import datetime
@@ -98,7 +100,6 @@ class VikasFlyViewGCS(QMainWindow):
         default_dem = os.path.abspath(os.path.join(os.path.dirname(__file__), "data", "elevation.tif"))
         self.dem = DemManager(default_dem if os.path.exists(default_dem) else None)
 
-        # Dual Stream Workers
         self.cam_worker_day = None
         self.cam_worker_thermal = None
         self.day_rtsp_url = ""
@@ -114,7 +115,6 @@ class VikasFlyViewGCS(QMainWindow):
         self.latest_sol = None
         self.latest_corr = None
         
-        # Primary view state: True = Map is Fullscreen, False = Video is Fullscreen
         self.map_is_primary = True
         self.custom_udp_conn = "udpin:0.0.0.0:14550"
 
@@ -128,6 +128,7 @@ class VikasFlyViewGCS(QMainWindow):
         self.artillery_auth_pin = "1234"
         self.active_pick_entity = None
         self.active_pick_source = None
+        self.current_home_coords = None
 
         self.canvas = QWidget(self)
         self.setCentralWidget(self.canvas)
@@ -136,22 +137,31 @@ class VikasFlyViewGCS(QMainWindow):
         # Primary Component 1: Map View Container
         # -----------------------------------------------------------------
         self.map_container = QFrame(self.canvas)
-        self.map_container.setStyleSheet("background-color: #0b0f19; border: none;")
+        self.map_container.setStyleSheet("background-color: #080d14; border: none;")
         map_layout = QVBoxLayout(self.map_container)
         map_layout.setContentsMargins(0, 0, 0, 0)
+        map_layout.setSpacing(0)
 
         self.web_map = QWebEngineView(self.map_container)
-        self.web_map.setStyleSheet("background-color: #0b0f19;")
+        self.web_map.setStyleSheet("background-color: #080d14;")
         settings = self.web_map.settings()
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.AllowRunningInsecureContent, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, False)
 
         map_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "ui", "map_view.html"))
         self.web_map.load(QUrl.fromLocalFile(map_path))
         self.web_map.titleChanged.connect(self.on_map_event)
-        self.web_map.loadFinished.connect(lambda ok: QTimer.singleShot(400, self.safe_fix_map))
+
+        # Staged invalidation triggers to guarantee edge-to-edge stretching
+        def _on_map_loaded(ok):
+            if ok:
+                for delay in [50, 200, 500, 1000]:
+                    QTimer.singleShot(delay, self.safe_fix_map)
+
+        self.web_map.loadFinished.connect(_on_map_loaded)
         map_layout.addWidget(self.web_map)
 
         # -----------------------------------------------------------------
@@ -175,7 +185,7 @@ class VikasFlyViewGCS(QMainWindow):
         self.video_layout.addWidget(self.video_view_thermal)
         self.video_view_thermal.hide()
 
-        # Floating Swap Button (Always on top of the PIP viewport)
+        # Floating Swap Button
         self.btn_swap_pip = QPushButton("⇄ SWAP", self.canvas)
         self.btn_swap_pip.setFixedSize(70, 24)
         self.btn_swap_pip.setStyleSheet("""
@@ -223,6 +233,18 @@ class VikasFlyViewGCS(QMainWindow):
 
         self.lbl_gps_hdop = QLabel("🛰 0 Sats (HDOP: --)")
         td_layout.addWidget(self.lbl_gps_hdop)
+
+        # Air-Gapped Safe Map Package Ingest
+        self.btn_load_map = QPushButton("📥 LOAD MAP PKG")
+        self.btn_load_map.setStyleSheet("""
+            QPushButton {
+                background-color: #0f172a; border: 1px solid #22c55e; border-radius: 4px;
+                color: #22c55e; font-size: 8.5pt; font-weight: bold; padding: 3px 8px;
+            }
+            QPushButton:hover { background-color: #15803d; color: white; }
+        """)
+        self.btn_load_map.clicked.connect(self.ingest_map_package_from_storage)
+        td_layout.addWidget(self.btn_load_map)
 
         self.cmb_conn_type = QComboBox()
         self.cmb_conn_type.setProperty("class", "mav_combo_box")
@@ -350,7 +372,6 @@ class VikasFlyViewGCS(QMainWindow):
     # Zero-Reparenting Layout & View Swapping
     # -------------------------------------------------------------
     def swap_views(self):
-        """Swaps fullscreen and PIP views cleanly without destroying WebEngine OpenGL surfaces."""
         self.map_is_primary = not self.map_is_primary
         self.resizeEvent(None)
         self.safe_fix_map()
@@ -361,40 +382,32 @@ class VikasFlyViewGCS(QMainWindow):
         w, h = self.width(), self.height()
         self.canvas.setGeometry(0, 0, w, h)
 
-        # Calculate PIP Geometry
         pip_w = 520 if self.is_split_dual_view else 300
         pip_h = 210
         pip_x, pip_y = 20, h - (pip_h + 30)
 
-        # Apply geometry based on active primary view
         if self.map_is_primary:
-            # Map is Fullscreen
             self.map_container.setGeometry(0, 0, w, h)
-            self.map_container.setStyleSheet("background-color: #0b0f19; border: none;")
+            self.web_map.setGeometry(0, 0, w, h)
+            self.map_container.setStyleSheet("background-color: #080d14; border: none;")
 
-            # Video is in PIP
             self.video_container.setGeometry(pip_x, pip_y, pip_w, pip_h)
             self.video_container.setStyleSheet("border: 2px solid #00ffcc; border-radius: 6px; background-color: #000;")
             
-            # Position Swap Button inside the Video PIP box
             self.btn_swap_pip.setGeometry(pip_x + 8, pip_y + 8, 70, 24)
 
-            # Stack order
             self.map_container.lower()
             self.video_container.raise_()
         else:
-            # Video is Fullscreen
             self.video_container.setGeometry(0, 0, w, h)
             self.video_container.setStyleSheet("background-color: #000000; border: none;")
 
-            # Map is in PIP
             self.map_container.setGeometry(pip_x, pip_y, pip_w, pip_h)
-            self.map_container.setStyleSheet("border: 2px solid #00ffcc; border-radius: 6px; background-color: #0b0f19;")
+            self.web_map.setGeometry(0, 0, pip_w, pip_h)
+            self.map_container.setStyleSheet("border: 2px solid #00ffcc; border-radius: 6px; background-color: #080d14;")
             
-            # Position Swap Button inside the Map PIP box
             self.btn_swap_pip.setGeometry(pip_x + 8, pip_y + 8, 70, 24)
 
-            # Stack order
             self.video_container.lower()
             self.map_container.raise_()
 
@@ -404,7 +417,6 @@ class VikasFlyViewGCS(QMainWindow):
         self.top_dashboard.setGeometry(0, 0, w, 36)
         self.top_dashboard.raise_()
 
-        # Gimbal Control Panel: Full vs Minimized[cite: 9]
         if self.gimbal_panel.is_minimized:
             gimbal_w, gimbal_h = 140, 32
         else:
@@ -426,9 +438,76 @@ class VikasFlyViewGCS(QMainWindow):
             self.plan_side_panel.raise_()
 
         self.gimbal_panel.raise_()
+        self.safe_fix_map()
+        QTimer.singleShot(150, self.safe_fix_map)
 
     # -------------------------------------------------------------
-    # Dual RTSP Streams Execution
+    # Safe Map Ingestion (Prevents Self-Copy Windows Lock Error)
+    # -------------------------------------------------------------
+    def ingest_map_package_from_storage(self):
+        src_dir = QFileDialog.getExistingDirectory(
+            self, "Select Tactical Map Folder (USB or External Drive)", os.path.expanduser("~")
+        )
+        if not src_dir:
+            return
+
+        target_tile_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "ui", "tiles"))
+        os.makedirs(target_tile_dir, exist_ok=True)
+
+        src_dir_abs = os.path.abspath(src_dir)
+        if src_dir_abs == target_tile_dir or src_dir_abs.startswith(target_tile_dir):
+            QMessageBox.information(
+                self, "Already Active",
+                "These tiles are already located inside the GCS directory and are currently active!"
+            )
+            self.safe_fix_map()
+            return
+
+        look_dir = src_dir_abs
+        if os.path.exists(os.path.join(src_dir_abs, "tiles")):
+            look_dir = os.path.join(src_dir_abs, "tiles")
+
+        self.lbl_veh_msg.setText("MSG: INGESTING AIR-GAPPED MAP PACKAGE...")
+        copied_files = 0
+        skipped_locked = 0
+
+        try:
+            for root, dirs, files in os.walk(look_dir):
+                rel_path = os.path.relpath(root, look_dir)
+                dest_root = os.path.join(target_tile_dir, rel_path)
+                os.makedirs(dest_root, exist_ok=True)
+
+                for f in files:
+                    if not f.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        continue
+                    s_file = os.path.join(root, f)
+                    d_file = os.path.join(dest_root, f)
+
+                    if os.path.exists(d_file) and os.path.getsize(d_file) == os.path.getsize(s_file):
+                        continue
+
+                    try:
+                        shutil.copy2(s_file, d_file)
+                        copied_files += 1
+                    except PermissionError:
+                        skipped_locked += 1
+                        continue
+
+            self.safe_fix_map()
+            QMessageBox.information(
+                self, "Sector Package Ingested",
+                f"Tactical map ingestion completed!\n\n"
+                f"• New Tiles Installed: {copied_files}\n"
+                f"• Active In-Use Tiles Preserved: {skipped_locked}\n\n"
+                f"Sector is active offline."
+            )
+            self.lbl_veh_msg.setText("MSG: OFFLINE MISSION THEATER LOADED")
+        except Exception as e:
+            QMessageBox.critical(self, "Ingest Error", f"Failed to ingest map package:\n{e}")
+            self.lbl_veh_msg.setText("MSG: MAP INGESTION ERROR")
+
+    # -------------------------------------------------------------
+    # Dual RTSP Streams Execution & Synchronous Teardown
     # -------------------------------------------------------------
     def _load_cached_camera_urls(self):
         if os.path.exists(CONFIG_FILE):
@@ -449,17 +528,32 @@ class VikasFlyViewGCS(QMainWindow):
         self.thermal_rtsp_url = thermal_url
         self._start_both_streams()
 
+    def _stop_active_camera_threads(self):
+        if self.cam_worker_day is not None:
+            try:
+                self.cam_worker_day.frame_received.disconnect()
+            except Exception:
+                pass
+            self.cam_worker_day.stop()
+            self.cam_worker_day = None
+
+        if self.cam_worker_thermal is not None:
+            try:
+                self.cam_worker_thermal.frame_received.disconnect()
+            except Exception:
+                pass
+            self.cam_worker_thermal.stop()
+            self.cam_worker_thermal = None
+
     def _start_both_streams(self):
+        self._stop_active_camera_threads()
+
         if self.day_rtsp_url:
-            if self.cam_worker_day:
-                self.cam_worker_day.stop()
             self.cam_worker_day = GimbalCameraThread(source=self.day_rtsp_url, parent=self)
             self.cam_worker_day.frame_received.connect(self.video_view_day.update_frame)
             self.cam_worker_day.start()
 
         if self.thermal_rtsp_url:
-            if self.cam_worker_thermal:
-                self.cam_worker_thermal.stop()
             self.cam_worker_thermal = GimbalCameraThread(source=self.thermal_rtsp_url, parent=self)
             self.cam_worker_thermal.frame_received.connect(self.video_view_thermal.update_frame)
             self.cam_worker_thermal.start()
@@ -562,7 +656,6 @@ class VikasFlyViewGCS(QMainWindow):
             self.swap_views()
 
         if self.current_view_mode == "PLAN":
-            # Default mission cruise parameters applied automatically behind the scenes
             default_alt = 30.0
             speed = 5.0
             hover = 0.0
@@ -576,6 +669,7 @@ class VikasFlyViewGCS(QMainWindow):
                 f"if (typeof panAndHighlightLocation === 'function') {{ panAndHighlightLocation({lat}, {lon}, '{mgrs_val}'); }}"
             )
             self.lbl_veh_msg.setText(f"MSG: PLOTTED LOCATION -> {mgrs_val}")
+
     def enter_flight_plan_mode(self):
         self.current_view_mode = "PLAN"
         if not self.map_is_primary:
@@ -613,14 +707,14 @@ class VikasFlyViewGCS(QMainWindow):
             home_lat = self.hud_overlay.telem.get("lat", 20.5937)
             home_lon = self.hud_overlay.telem.get("lon", 78.9629)
             self.web_map.page().runJavaScript(
-                f"if (typeof addWaypoint === 'function') {{{{ addWaypoint({home_lat}, {home_lon}, 20.0, 5.0, 0.0); }}}}"
+                f"if (typeof addWaypoint === 'function') {{ addWaypoint({home_lat}, {home_lon}, 20.0, 5.0, 0.0); }}"
             )
         elif tool_name == "CENTER":
             lat = self.hud_overlay.telem.get("lat")
             lon = self.hud_overlay.telem.get("lon")
             if lat and lon:
                 self.web_map.page().runJavaScript(
-                    f"if (typeof map !== 'undefined' && map) {{{{ map.setView([{lat}, {lon}], 17); }}}}"
+                    f"if (typeof map !== 'undefined' && map) {{ map.setView([{lat}, {lon}], 15); }}"
                 )
         elif tool_name == "FILE_SAVE":
             self.save_mission_to_file()
@@ -715,6 +809,7 @@ class VikasFlyViewGCS(QMainWindow):
             self.mission_execution_state = "IDLE"
             self.plan_side_panel.set_button_state("START")
             self.lbl_veh_msg.setText("MSG: TELEMETRY DISCONNECTED")
+            self.current_home_coords = None
         else:
             conn_str = self.get_connection_string()
             baud_text = self.cmb_baud.currentText().strip()
@@ -735,9 +830,20 @@ class VikasFlyViewGCS(QMainWindow):
         lat = t.get("lat")
         lon = t.get("lon")
         compass = t.get("compass", 0.0)
-        if lat and lon:
+
+        if lat and lon and lat != 0.0 and lon != 0.0:
+            if not self.current_home_coords:
+                self.current_home_coords = (lat, lon)
+                self.web_map.page().runJavaScript(
+                    f"if (typeof setHomePosition === 'function') {{ setHomePosition({lat}, {lon}); }}"
+                )
+                self.web_map.page().runJavaScript(
+                    f"if (typeof map !== 'undefined' && map) {{ map.setView([{lat}, {lon}], 15); }}"
+                )
+                self.lbl_veh_msg.setText(f"MSG: AUTO-HOME DETECTED -> {lat:.5f}, {lon:.5f}")
+
             self.web_map.page().runJavaScript(
-                f"if (typeof updatePosition === 'function') {{{{ updatePosition({lat}, {lon}, {compass}); }}}}"
+                f"if (typeof updatePosition === 'function') {{ updatePosition({lat}, {lon}, {compass}); }}"
             )
 
     def save_mission_to_file(self):
@@ -784,15 +890,19 @@ class VikasFlyViewGCS(QMainWindow):
                 finish_act = data["mission"].get("finishAction", "RTL")
                 for itm in data["mission"]["items"]:
                     waypoints_loaded.append({
-                        "lat": float(itm.get("lat")), "lon": float(itm.get("lon")),
-                        "alt": float(itm.get("alt", 30.0)), "speed": float(itm.get("speed", 5.0)),
+                        "lat": float(itm.get("lat")), 
+                        "lon": float(itm.get("lon")),
+                        "alt": float(itm.get("alt", 30.0)), 
+                        "speed": float(itm.get("speed", 5.0)),
                         "hover": float(itm.get("hover", 0.0))
                     })
             elif isinstance(data, list):
                 for itm in data:
                     waypoints_loaded.append({
-                        "lat": float(itm["lat"]), "lon": float(itm["lon"]),
-                        "alt": float(itm.get("alt", 30.0)), "speed": float(itm.get("speed", 5.0)),
+                        "lat": float(itm["lat"]), 
+                        "lon": float(itm["lon"]),
+                        "alt": float(itm.get("alt", 30.0)), 
+                        "speed": float(itm.get("speed", 5.0)),
                         "hover": float(itm.get("hover", 0.0))
                     })
 
@@ -818,12 +928,12 @@ class VikasFlyViewGCS(QMainWindow):
 
     def handle_waypoint_param_update(self, idx, new_alt, new_spd, new_hov):
         self.web_map.page().runJavaScript(
-            f"if (typeof updateWaypointParams === 'function') {{{{ updateWaypointParams({idx}, {new_alt}, {new_spd}, {new_hov}); }}}}"
+            f"if (typeof updateWaypointParams === 'function') {{ updateWaypointParams({idx}, {new_alt}, {new_spd}, {new_hov}); }}"
         )
 
     def delete_waypoint(self, idx):
         self.web_map.page().runJavaScript(
-            f"if (typeof deleteWaypointByIndex === 'function') {{{{ deleteWaypointByIndex({idx}); }}}}"
+            f"if (typeof deleteWaypointByIndex === 'function') {{ deleteWaypointByIndex({idx}); }}"
         )
 
     def handle_finish_action_update(self, action_code: str):
@@ -952,7 +1062,7 @@ class VikasFlyViewGCS(QMainWindow):
         self.active_pick_entity = entity_type
         if source_type == "MAP":
             self.web_map.page().runJavaScript(
-                f"if (typeof setSelectionMode === 'function') {{{{ setSelectionMode('{entity_type}'); }}}}"
+                f"if (typeof setSelectionMode === 'function') {{ setSelectionMode('{entity_type}'); }}"
             )
         elif source_type == "VIDEO":
             if self.map_is_primary:
@@ -979,14 +1089,14 @@ class VikasFlyViewGCS(QMainWindow):
             self.target_pt = (pt_lat, pt_lon, pt_elev)
             self.setup_dialog.receive_picked_coord("TARGET", pt_lat, pt_lon, pt_elev)
             self.web_map.page().runJavaScript(
-                f"if (typeof setTargetPosition === 'function') {{{{ setTargetPosition({pt_lat}, {pt_lon}); }}}}"
+                f"if (typeof setTargetPosition === 'function') {{ setTargetPosition({pt_lat}, {pt_lon}); }}"
             )
             TacticalTargetPopup("TARGET", {"lat": pt_lat, "lon": pt_lon, "alt": pt_elev, "mgrs": pt_mgrs}, self).exec()
         elif entity == "IMPACT":
             self.impact_pt = (pt_lat, pt_lon, pt_elev)
             self.setup_dialog.receive_picked_coord("IMPACT", pt_lat, pt_lon, pt_elev)
             self.web_map.page().runJavaScript(
-                f"if (typeof setImpactPosition === 'function') {{{{ setImpactPosition({pt_lat}, {pt_lon}); }}}}"
+                f"if (typeof setImpactPosition === 'function') {{ setImpactPosition({pt_lat}, {pt_lon}); }}"
             )
 
     def on_map_event(self, title):
@@ -1025,7 +1135,7 @@ class VikasFlyViewGCS(QMainWindow):
             lat, lon = float(parts[0]), float(parts[1])
             mgrs_val = to_mgrs_gr(lat, lon)
             self.web_map.page().runJavaScript(
-                f"if (typeof showInspectPopup === 'function') {{{{ showInspectPopup({lat}, {lon}, '{mgrs_val}'); }}}}"
+                f"if (typeof showInspectPopup === 'function') {{ showInspectPopup({lat}, {lon}, '{mgrs_val}'); }}"
             )
 
     def handle_setup_applied(self, data):
@@ -1044,14 +1154,21 @@ class VikasFlyViewGCS(QMainWindow):
 
     def safe_fix_map(self):
         if hasattr(self, 'web_map') and self.web_map:
-            self.web_map.page().runJavaScript("if (typeof fixMapSize === 'function') { fixMapSize(); }")
+            self.web_map.page().runJavaScript(
+                """
+                if (typeof map !== 'undefined' && map) {
+                    map.invalidateSize({ animate: false, pan: false });
+                }
+                """
+            )
 
     def closeEvent(self, event):
         self.port_scan_timer.stop()
-        if self.cam_worker_day: self.cam_worker_day.stop()
-        if self.cam_worker_thermal: self.cam_worker_thermal.stop()
-        if self.mav_worker: self.mav_worker.stop()
-        if self.dem: self.dem.close()
+        self._stop_active_camera_threads()
+        if self.mav_worker:
+            self.mav_worker.stop()
+        if self.dem:
+            self.dem.close()
         event.accept()
 
 if __name__ == "__main__":

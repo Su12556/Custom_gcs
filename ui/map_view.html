@@ -4,34 +4,48 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <link rel="stylesheet" href="leaflet/leaflet.css" />
+    <script src="leaflet/leaflet.js"></script>
     <style>
-        html,
-        body {
+        * {
+            box-sizing: border-box;
             margin: 0;
             padding: 0;
-            width: 100%;
-            height: 100%;
-            background: #0b0f19;
-            overflow: hidden;
+        }
+
+        html,
+        body {
+            width: 100% !important;
+            height: 100% !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            overflow: hidden !important;
+            background-color: #060b13 !important;
         }
 
         #map {
-            width: 100%;
-            height: 100%;
-            position: absolute;
-            top: 0;
-            bottom: 0;
-            left: 0;
-            right: 0;
+            position: absolute !important;
+            top: 0 !important;
+            left: 0 !important;
+            right: 0 !important;
+            bottom: 0 !important;
+            width: 100% !important;
+            height: 100% !important;
+            background-color: #060b13 !important;
+        }
+
+        /* High-accuracy hardware tile scaling (removes pixelation and blocky seams) */
+        .leaflet-tile-container img {
+            image-rendering: auto !important;
+            image-rendering: -webkit-optimize-contrast !important;
+            backface-visibility: hidden;
+            transform: translate3d(0, 0, 0);
         }
 
         .leaflet-tile-pane {
-            filter: brightness(1.0) contrast(1.05);
+            filter: brightness(1.0) contrast(1.03);
         }
 
-        /* Shift Leaflet zoom control cleanly to bottom-right corner */
         .leaflet-bottom.leaflet-right {
             bottom: 20px !important;
             right: 20px !important;
@@ -59,6 +73,68 @@
         .leaflet-bar a:hover {
             background-color: #0284c7 !important;
             color: #ffffff !important;
+        }
+
+        .leaflet-top.leaflet-left {
+            top: 220px !important;
+            left: 20px !important;
+        }
+
+        .leaflet-control-layers {
+            background: rgba(15, 23, 42, 0.95) !important;
+            border: 1px solid #00ffcc !important;
+            color: #ffffff !important;
+            font-family: 'Segoe UI', 'Consolas', monospace !important;
+            font-size: 11px !important;
+            border-radius: 6px !important;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6) !important;
+            padding: 6px 10px !important;
+        }
+
+        .leaflet-control-layers-base label {
+            margin: 4px 0;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .leaflet-control-layers-toggle {
+            filter: invert(1) drop-shadow(0px 0px 4px #00ffcc);
+        }
+
+        #bottom_zoom_hud {
+            position: absolute;
+            bottom: 240px;
+            left: 20px;
+            z-index: 1000;
+            background: rgba(15, 23, 42, 0.92);
+            border: 1px solid #38bdf8;
+            border-radius: 4px;
+            padding: 5px 12px;
+            color: #38bdf8;
+            font-family: 'Consolas', monospace;
+            font-size: 12px;
+            font-weight: bold;
+            letter-spacing: 0.5px;
+            pointer-events: none;
+            box-shadow: 0 0 10px rgba(56, 189, 248, 0.35);
+        }
+
+        #tactical_status {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            z-index: 1000;
+            background: rgba(15, 23, 42, 0.9);
+            border: 1px solid #00ffcc;
+            border-radius: 4px;
+            padding: 4px 10px;
+            color: #00ffcc;
+            font-family: 'Consolas', monospace;
+            font-size: 11px;
+            font-weight: bold;
+            pointer-events: none;
         }
 
         .uav-base-wrap {
@@ -119,6 +195,9 @@
 
 <body>
     <div id="map"></div>
+    <div id="tactical_status">OFFLINE ZOOM: 15 (HI-RES THEATER)</div>
+    <div id="bottom_zoom_hud">ZOOM: LVL 15 / 21</div>
+
     <script>
         var map = null;
         var droneMarker = null, homeMarker = null, targetMarker = null, impactMarker = null;
@@ -129,9 +208,33 @@
         var waypoints = [];
         var missionPolyline = null, returnPolyline = null;
         var currentCruiseAlt = 30.0, currentCruiseSpeed = 5.0, defaultHoverSec = 0.0;
-        var plottedInspectMarkers = [];
 
-        function fixMapSize() { if (map) { map.invalidateSize(true); } }
+        function fixMapSize() {
+            if (map) { map.invalidateSize({ animate: false, pan: false }); }
+        }
+
+        function updateZoomDisplay() {
+            if (!map) return;
+            var z = map.getZoom();
+            var zoomHud = document.getElementById("bottom_zoom_hud");
+            if (zoomHud) {
+                zoomHud.innerText = "ZOOM: LVL " + z + " / 21";
+                if (z >= 14) {
+                    zoomHud.style.borderColor = "#00ffcc";
+                    zoomHud.style.color = "#00ffcc";
+                    zoomHud.style.boxShadow = "0 0 10px rgba(0, 255, 204, 0.5)";
+                } else {
+                    zoomHud.style.borderColor = "#38bdf8";
+                    zoomHud.style.color = "#38bdf8";
+                    zoomHud.style.boxShadow = "0 0 10px rgba(56, 189, 248, 0.35)";
+                }
+            }
+            var statusElem = document.getElementById("tactical_status");
+            if (statusElem) {
+                statusElem.innerText = "OFFLINE ZOOM: " + z + (z >= 14 ? " (HI-RES THEATER)" : " (INDIA REGIONAL)");
+            }
+        }
+
         function setSelectionMode(mode) { activeMode = mode; }
         function setCruiseAltitude(alt) { currentCruiseAlt = parseFloat(alt) || 30.0; }
 
@@ -163,9 +266,12 @@
             if (!homeMarker) {
                 var homeIcon = L.divIcon({ html: '<div class="qgc-home-pin">H</div>', className: '', iconSize: [28, 28], iconAnchor: [14, 14] });
                 homeMarker = L.marker(pos, { icon: homeIcon }).addTo(map);
-                homeMarker.bindPopup("<b>Home Position</b>");
             } else {
                 homeMarker.setLatLng(pos);
+            }
+            if (!hasCenteredOnDrone) {
+                map.setView(pos, 15);
+                hasCenteredOnDrone = true;
             }
             redrawMissionRoute();
         }
@@ -182,7 +288,7 @@
             });
 
             var marker = L.marker([lat, lon], { icon: wpIcon, draggable: true }).addTo(map);
-            marker.bindPopup(`<b>WP #${wpNum}</b><br>Alt: ${wpAlt}m<br>Speed: ${wpSpd}m/s<br>Hover: ${wpHov}s`);
+            marker.bindPopup(`<b>WP #${wpNum}</b><br>Speed: ${wpSpd}m/s<br>Hover: ${wpHov}s`);
 
             marker.on('drag', function () {
                 var newPos = marker.getLatLng();
@@ -195,11 +301,9 @@
             });
 
             marker.on('dragend', function () { notifyWaypointsChanged(); });
-
             waypoints.push({ lat: lat, lon: lon, alt: wpAlt, speed: wpSpd, hover: wpHov, marker: marker });
             redrawMissionRoute();
             notifyWaypointsChanged();
-            map.panTo([lat, lon]);
         }
 
         function loadWaypointsBatch(wpList) {
@@ -211,33 +315,6 @@
                 bounds.push([wp.lat, wp.lon]);
             });
             if (bounds.length > 0 && map) { map.fitBounds(bounds, { padding: [50, 50] }); }
-        }
-
-        function updateWaypointParams(idx, newAlt, newSpd, newHov) {
-            if (idx >= 0 && idx < waypoints.length) {
-                waypoints[idx].alt = parseFloat(newAlt) || 30.0;
-                waypoints[idx].speed = parseFloat(newSpd) || 5.0;
-                waypoints[idx].hover = parseFloat(newHov) || 0.0;
-                waypoints[idx].marker.bindPopup(`<b>WP #${idx + 1}</b><br>Alt: ${waypoints[idx].alt}m<br>Speed: ${waypoints[idx].speed}m/s<br>Hover: ${waypoints[idx].hover}s`);
-                notifyWaypointsChanged();
-            }
-        }
-
-        function deleteWaypointByIndex(idx) {
-            if (idx >= 0 && idx < waypoints.length) {
-                map.removeLayer(waypoints[idx].marker);
-                waypoints.splice(idx, 1);
-                waypoints.forEach((w, i) => {
-                    var newNum = i + 1;
-                    var newIcon = L.divIcon({
-                        html: `<div class="qgc-wp-pin" id="wp_icon_${newNum}">${newNum}</div>`,
-                        className: '', iconSize: [26, 26], iconAnchor: [13, 13]
-                    });
-                    w.marker.setIcon(newIcon);
-                });
-                redrawMissionRoute();
-                notifyWaypointsChanged();
-            }
         }
 
         function redrawMissionRoute() {
@@ -289,7 +366,6 @@
             }
 
             if (!homeMarker) { setHomePosition(lat, lon); }
-            if (!hasCenteredOnDrone) { map.setView(pos, 17); hasCenteredOnDrone = true; }
         }
 
         function setTargetPosition(lat, lon) {
@@ -311,23 +387,56 @@
             if (!map) return;
             var marker = L.circleMarker([lat, lon], { radius: 7, fillColor: "#facc15", color: "#ffffff", weight: 2, fillOpacity: 1.0 }).addTo(map);
             marker.bindPopup(`<b>INSPECT LOCATION</b><br>Lat: ${lat.toFixed(6)}°<br>Lon: ${lon.toFixed(6)}°<br><b>GR: ${mgrs}</b>`).openPopup();
-            plottedInspectMarkers.push(marker);
         }
 
         function panAndHighlightLocation(lat, lon, mgrs) {
             if (!map) return;
-            map.flyTo([lat, lon], 17, { animate: true, duration: 1.0 });
+            map.flyTo([lat, lon], 15, { animate: true, duration: 1.0 });
             showInspectPopup(lat, lon, mgrs);
         }
 
         function initMap() {
-            // Position zoom controls cleanly at bottom-right
-            map = L.map('map', { zoomControl: false, attributionControl: false, maxZoom: 22 }).setView([20.5937, 78.9629], 5);
+            if (typeof L === 'undefined') return;
+
+            map = L.map('map', {
+                zoomControl: false,
+                attributionControl: false,
+                minZoom: 4,
+                maxZoom: 21,
+                fadeAnimation: true,
+                zoomAnimation: true
+            }).setView([21.1702, 72.8311], 15);
+
             L.control.zoom({ position: 'bottomright' }).addTo(map);
 
-            L.tileLayer('https://{s}.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', {
-                maxZoom: 22, subdomains: ['mt0', 'mt1', 'mt2', 'mt3']
-            }).addTo(map);
+            // 1. ONLINE STREAM LAYER
+            var onlineLayer = L.tileLayer('https://{s}.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', {
+                minZoom: 3,
+                maxZoom: 21,
+                subdomains: ['mt0', 'mt1', 'mt2', 'mt3']
+            });
+
+            // 2. UNIFIED OFFLINE LAYER (Unified pyramid handling prevents rectangular block seams)
+           // Change maxNativeZoom to 9 for the basemap or decouple it so Zoom 9 tiles upscale cleanly everywhere
+            var offlineLayer = L.tileLayer('./tiles/{z}/{x}/{y}.png', {
+                minZoom: 4,
+                maxZoom: 21,
+                maxNativeZoom: 9,      // Upscales Zoom 9 images into Zoom 10, 11, 12, 13 without blank screens
+                minNativeZoom: 4,
+                tileSize: 256,
+                keepBuffer: 8,
+                errorTileUrl: 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
+            });
+            offlineLayer.addTo(map);
+
+            var baseMaps = {
+                "🛡 Pure Air-Gapped Disk": offlineLayer,
+                "🛰 Auto (Online + Offline)": onlineLayer
+            };
+            L.control.layers(baseMaps, null, { position: 'topleft', collapsed: true }).addTo(map);
+
+            map.on('zoomend', updateZoomDisplay);
+            map.on('zoom', updateZoomDisplay);
 
             map.on('click', function (e) {
                 var lat = e.latlng.lat;
@@ -346,11 +455,13 @@
                 }
             });
 
-            setTimeout(fixMapSize, 200);
+            updateZoomDisplay();
+            setTimeout(fixMapSize, 50);
+            setTimeout(fixMapSize, 250);
+            setTimeout(fixMapSize, 600);
         }
 
-        var ro = new ResizeObserver(function () { fixMapSize(); });
-        ro.observe(document.body);
+        window.addEventListener('resize', fixMapSize);
         window.addEventListener('load', initMap);
     </script>
 </body>
