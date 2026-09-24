@@ -9,6 +9,7 @@ from pymavlink import mavutil
 class MavlinkWorker(QThread):
     telemetry_updated = Signal(dict)
     log_entry_received = Signal(dict)
+    raw_message_received = Signal(object)
     log_download_progress = Signal(int, int, float)  # log_id, bytes_received, percent
 
     def __init__(self, connection_string="udpin:0.0.0.0:14550", baud=115200):

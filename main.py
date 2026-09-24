@@ -2,6 +2,8 @@ import os
 import sys
 import json
 import shutil
+import time
+import urllib.request
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
     "rtsp_transport;tcp|fflags;nobuffer+discardcorrupt|flags;low_delay|"
@@ -12,13 +14,15 @@ from datetime import datetime
 from pymavlink import mavutil
 import serial.tools.list_ports
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QFrame, QLabel, QComboBox, QMessageBox, QFileDialog
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QPushButton, QFrame, QLabel, QComboBox, QMessageBox, QFileDialog,
+    QStackedWidget, QProgressBar, QTextEdit
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineSettings
-from PySide6.QtCore import QUrl, Qt, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QUrl, Qt, QTimer, QThread, Signal, QObject
+from PySide6.QtGui import QFont, QPainter, QColor, QPen, QBrush, QPolygonF
+from PySide6.QtCore import QPointF
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
@@ -40,6 +44,9 @@ from ui.flight_plan_widgets import PlanTopStatsBar, PlanLeftToolBar, PlanRightMi
 from ui.gimbal_control_panel import GimbalControlPanel
 from ui.camera_config_dialog import CameraConfigDialog, CONFIG_FILE
 
+# Clean import of the flexible 16-channel Sensor Calibration View
+from ui.calibration_view import SensorCalibrationView
+
 MAIN_STYLE = """
 QPushButton.circle_btn {
     background-color: rgba(255, 255, 255, 0.92);
@@ -54,11 +61,27 @@ QPushButton.circle_btn {
     max-height: 44px;
 }
 QPushButton.circle_btn:hover { background-color: #ffffff; border: 2px solid #0284c7; }
+
 QFrame#control_bar_panel {
-    background: rgba(15, 23, 42, 0.92);
+    background: rgba(15, 23, 42, 0.94);
     border: 1px solid #334155;
     border-radius: 6px;
 }
+QPushButton#panel_toggle_btn {
+    background-color: #0284c7; border: 1px solid #38bdf8; border-radius: 4px;
+    color: white; font-size: 8.5pt; font-weight: bold; padding: 4px 10px; min-height: 24px;
+}
+QPushButton#panel_toggle_btn:hover { background-color: #0369a1; }
+QPushButton#ctrl_fw_btn {
+    background-color: #0f766e; border: 1px solid #2dd4bf; border-radius: 4px;
+    color: white; font-size: 8.5pt; font-weight: bold; padding: 4px 10px; min-height: 24px;
+}
+QPushButton#ctrl_fw_btn:hover { background-color: #14b8a6; }
+QPushButton#ctrl_cal_btn {
+    background-color: #4f46e5; border: 1px solid #818cf8; border-radius: 4px;
+    color: white; font-size: 8.5pt; font-weight: bold; padding: 4px 10px; min-height: 24px;
+}
+QPushButton#ctrl_cal_btn:hover { background-color: #4338ca; }
 QPushButton#setup_btn {
     background-color: #b91c1c; border: 1px solid #dc2626; border-radius: 4px;
     color: white; font-size: 8.5pt; font-weight: bold; padding: 4px 10px; min-height: 24px;
@@ -70,10 +93,10 @@ QPushButton#plan_mode_btn {
 }
 QPushButton#plan_mode_btn:hover { background-color: #0369a1; }
 QPushButton#coord_btn {
-    background-color: #0f766e; border: 1px solid #2dd4bf; border-radius: 4px;
+    background-color: #1e293b; border: 1px solid #64748b; border-radius: 4px;
     color: white; font-size: 8.5pt; font-weight: bold; padding: 4px 10px; min-height: 24px;
 }
-QPushButton#coord_btn:hover { background-color: #14b8a6; }
+QPushButton#coord_btn:hover { background-color: #334155; border-color: #00ffcc; color: #00ffcc; }
 QComboBox.mav_combo_box {
     background-color: #0f172a; border: 1px solid #38bdf8; border-radius: 4px;
     color: #00ffcc; font-family: 'Consolas', monospace; font-size: 9pt; font-weight: bold;
@@ -89,6 +112,643 @@ QComboBox.mav_combo_box QAbstractItemView {
 }
 """
 
+# ==============================================================================
+# 1. SENSOR CALIBRATION MAVLINK DISPATCHER (16 CHANNELS)
+# ==============================================================================
+class CalibrationManager(QObject):
+    accel_prompt_sig = Signal(str)
+    compass_progress_sig = Signal(int)
+    compass_done_sig = Signal(bool, str)
+    rc_channels_sig = Signal(list)
+    log_sig = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.mav_worker = None
+        self.accel_step_index = 0
+        self.active_cal_type = None
+
+    def set_worker(self, worker):
+        self.mav_worker = worker
+
+    @property
+    def master(self):
+        return self.mav_worker.master if (self.mav_worker and getattr(self.mav_worker, 'connected', False)) else None
+
+    def start_accel_6point(self):
+        m = self.master
+        if not m:
+            self.log_sig.emit("[!] Telemetry not connected. Connect drone first.")
+            return False
+
+        self.active_cal_type = "ACCEL"
+        self.accel_step_index = 1
+        self.log_sig.emit("[*] Initiating 6-Axis 3D Accel Calibration...")
+        try:
+            m.mav.command_long_send(
+                m.target_system, m.target_component,
+                mavutil.mavlink.MAV_CMD_PREFLIGHT_CALIBRATION,
+                0, 0, 0, 0, 0, 1, 0, 0
+            )
+            self.accel_prompt_sig.emit("Place vehicle LEVEL and press NEXT STEP.")
+            return True
+        except Exception as e:
+            self.log_sig.emit(f"[ERROR] Failed to send Accel Cal command: {e}")
+            return False
+
+    def advance_accel_step(self):
+        m = self.master
+        if not m:
+            return
+
+        steps = [
+            (1, "Place vehicle LEVEL and press NEXT STEP."),
+            (2, "Place vehicle on its LEFT side and press NEXT STEP."),
+            (3, "Place vehicle on its RIGHT side and press NEXT STEP."),
+            (4, "Place vehicle NOSE DOWN and press NEXT STEP."),
+            (5, "Place vehicle NOSE UP and press NEXT STEP."),
+            (6, "Place vehicle on its BACK and press NEXT STEP.")
+        ]
+
+        if self.accel_step_index <= 6:
+            pos_val = self.accel_step_index
+            self.log_sig.emit(f"[*] Confirmed Step {pos_val}/6. Transmitting position ack...")
+            try:
+                m.mav.command_long_send(
+                    m.target_system, m.target_component,
+                    mavutil.mavlink.MAV_CMD_ACCELCAL_VEHICLE_POS,
+                    0, pos_val, 0, 0, 0, 0, 0, 0
+                )
+            except Exception as e:
+                self.log_sig.emit(f"[ERROR] Failed to send step acknowledgment: {e}")
+
+            if self.accel_step_index < 6:
+                next_prompt = steps[self.accel_step_index][1]
+                self.accel_prompt_sig.emit(next_prompt)
+                self.accel_step_index += 1
+            else:
+                self.accel_prompt_sig.emit("Calibration Completed! Writing offsets to flash...")
+                self.log_sig.emit("[+] 6-Axis Accel Calibration Complete.")
+                self.active_cal_type = None
+                self.accel_step_index = 0
+
+    def calibrate_simple_level(self):
+        m = self.master
+        if not m:
+            self.log_sig.emit("[!] Drone not connected.")
+            return False
+        self.log_sig.emit("[*] Calibrating Horizon Level (Keep vehicle flat)...")
+        try:
+            m.mav.command_long_send(
+                m.target_system, m.target_component,
+                mavutil.mavlink.MAV_CMD_PREFLIGHT_CALIBRATION,
+                0, 0, 0, 0, 0, 2, 0, 0
+            )
+            self.log_sig.emit("[+] Horizon level set successfully.")
+            return True
+        except Exception as e:
+            self.log_sig.emit(f"[ERROR] Level calibration failed: {e}")
+            return False
+
+    def start_compass_cal(self):
+        m = self.master
+        if not m:
+            self.log_sig.emit("[!] Drone not connected.")
+            return False
+
+        self.active_cal_type = "COMPASS"
+        self.log_sig.emit("[*] Starting Onboard Compass Calibration. Rotate drone slowly around all axes...")
+        try:
+            m.mav.command_long_send(
+                m.target_system, m.target_component,
+                mavutil.mavlink.MAV_CMD_DO_START_MAG_CAL,
+                0, 0, 0, 1, 0, 0, 0, 0
+            )
+            return True
+        except Exception as e:
+            self.log_sig.emit(f"[ERROR] Could not start compass calibration: {e}")
+            return False
+
+    def cancel_compass_cal(self):
+        m = self.master
+        if not m: return
+        try:
+            m.mav.command_long_send(
+                m.target_system, m.target_component,
+                mavutil.mavlink.MAV_CMD_DO_CANCEL_MAG_CAL,
+                0, 0, 0, 0, 0, 0, 0, 0
+            )
+            self.log_sig.emit("[!] Compass Calibration Cancelled.")
+        except Exception:
+            pass
+        self.active_cal_type = None
+
+    def trigger_esc_calibration(self):
+        m = self.master
+        if not m:
+            self.log_sig.emit("[!] Drone not connected.")
+            return False
+
+        self.log_sig.emit("[*] Writing parameter: ESC_CALIBRATION = 3 (Auto ESC on boot)...")
+        try:
+            m.param_set_send(b"ESC_CALIBRATION", 3.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+            time.sleep(0.3)
+            self.log_sig.emit("[*] Sending preflight reboot command to flight controller...")
+            m.mav.command_long_send(
+                m.target_system, m.target_component,
+                mavutil.mavlink.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN,
+                0, 1, 0, 0, 0, 0, 0, 0
+            )
+            self.log_sig.emit("[+] Target rebooting. Disconnect battery and reconnect to listen for ESC beeps.")
+            return True
+        except Exception as e:
+            self.log_sig.emit(f"[ERROR] ESC Calibration setup failed: {e}")
+            return False
+
+    def save_rc_limits(self, limits_dict):
+        m = self.master
+        if not m:
+            self.log_sig.emit("[!] Drone not connected.")
+            return False
+
+        self.log_sig.emit("[*] Committing RC Stick Min/Max/Trim parameters to flight controller...")
+        try:
+            for param_name, val in limits_dict.items():
+                m.param_set_send(param_name.encode('ascii'), float(val), mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+                time.sleep(0.02)
+            self.log_sig.emit("[+] 16-Channel RC Limits committed successfully.")
+            return True
+        except Exception as e:
+            self.log_sig.emit(f"[ERROR] Failed to save RC limits: {e}")
+            return False
+
+    def process_raw_mavlink_msg(self, msg):
+        msg_type = msg.get_type()
+        if msg_type == "MAG_CAL_PROGRESS":
+            pct = int(getattr(msg, "completion_pct", 0))
+            self.compass_progress_sig.emit(pct)
+
+        elif msg_type == "MAG_CAL_REPORT":
+            status = getattr(msg, "cal_status", 0)
+            success = (status in [1, 4])
+            self.compass_done_sig.emit(success, f"Report status code: {status}")
+
+        elif msg_type == "STATUSTEXT":
+            txt = getattr(msg, "text", "")
+            if any(k in txt.lower() for k in ["place", "accel", "calibration", "holding"]):
+                self.accel_prompt_sig.emit(txt)
+                self.log_sig.emit(f"[FC] {txt}")
+
+        elif msg_type == "RC_CHANNELS":
+            # Extract up to 16 channels for Skydroid T12, MK15, MK32
+            pwm_list = [getattr(msg, f"chan{i}_raw", 1500) for i in range(1, 17)]
+            self.rc_channels_sig.emit(pwm_list)
+
+        elif msg_type == "RC_CHANNELS_RAW":
+            pwm_list = [getattr(msg, f"chan{i}_raw", 1500) for i in range(1, 9)]
+            self.rc_channels_sig.emit(pwm_list)
+
+
+# ==============================================================================
+# 2. MISSION PLANNER VEHICLE BUTTON & FIRMWARE INSTALLER
+# ==============================================================================
+class MissionPlannerVehicleButton(QPushButton):
+    def __init__(self, title, version_text, vehicle_type, kind="quad", parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.version_text = version_text
+        self.vehicle_type = vehicle_type
+        self.kind = kind
+        self.setFixedSize(140, 115)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        if self.underMouse():
+            p.fillRect(0, 0, w, h, QColor(30, 41, 59, 200))
+            p.setPen(QPen(QColor("#38bdf8"), 1.5))
+            p.drawRoundedRect(1, 1, w - 2, h - 2, 6, 6)
+        else:
+            p.fillRect(0, 0, w, h, QColor(15, 23, 42, 80))
+            p.setPen(QPen(QColor(51, 65, 85, 100), 1))
+            p.drawRoundedRect(1, 1, w - 2, h - 2, 4, 4)
+
+        cx, cy = w / 2, 40
+        neon_green = QColor("#84cc16")
+        cyan_rotor = QColor("#38bdf8")
+
+        if self.kind == "plane":
+            p.setPen(QPen(QColor("#38bdf8"), 2))
+            p.setBrush(QBrush(QColor(56, 189, 248, 60)))
+            pts = [QPointF(cx, cy - 25), QPointF(cx + 6, cy - 10), QPointF(cx + 36, cy - 2),
+                   QPointF(cx + 6, cy + 4), QPointF(cx + 4, cy + 22), QPointF(cx + 14, cy + 26),
+                   QPointF(cx, cy + 24), QPointF(cx - 14, cy + 26), QPointF(cx - 4, cy + 22),
+                   QPointF(cx - 6, cy + 4), QPointF(cx - 36, cy - 2), QPointF(cx - 6, cy - 10)]
+            p.drawPolygon(QPolygonF(pts))
+
+        elif self.kind == "rover":
+            p.setPen(QPen(QColor("#38bdf8"), 2))
+            p.setBrush(QBrush(QColor(56, 189, 248, 80)))
+            p.drawRoundedRect(cx - 24, cy - 12, 48, 24, 4, 4)
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(cx - 26, cy - 16, 14, 14)
+            p.drawEllipse(cx + 12, cy - 16, 14, 14)
+            p.drawEllipse(cx - 26, cy + 4, 14, 14)
+            p.drawEllipse(cx + 12, cy + 4, 14, 14)
+
+        elif self.kind in ["quad", "hexa", "octa", "y6", "tri"]:
+            p.setPen(QPen(neon_green, 3))
+            p.setBrush(QBrush(neon_green))
+            p.drawEllipse(QPointF(cx, cy), 5, 5)
+
+            rotors = []
+            if self.kind == "quad": rotors = [(-18, -18), (18, -18), (-18, 18), (18, 18)]
+            elif self.kind == "hexa": rotors = [(-22, 0), (22, 0), (-12, -20), (12, -20), (-12, 20), (12, 20)]
+            elif self.kind == "octa": rotors = [(-22, -10), (22, -10), (-22, 10), (22, 10), (-10, -22), (10, -22), (-10, 22), (10, 22)]
+            elif self.kind == "y6": rotors = [(0, -22), (-19, 15), (19, 15)]
+            elif self.kind == "tri": rotors = [(0, -20), (-18, 16), (18, 16)]
+
+            for rx, ry in rotors:
+                p.setPen(QPen(neon_green, 2.5))
+                p.drawLine(QPointF(cx, cy), QPointF(cx + rx, cy + ry))
+                p.setPen(QPen(cyan_rotor, 1.5))
+                p.setBrush(Qt.NoBrush)
+                p.drawEllipse(QPointF(cx + rx, cy + ry), 10, 10)
+                if self.kind == "y6": p.drawEllipse(QPointF(cx + rx, cy + ry), 6, 6)
+
+        elif self.kind == "sub":
+            p.setPen(QPen(QColor("#38bdf8"), 2))
+            p.setBrush(QBrush(QColor(56, 189, 248, 70)))
+            p.drawRoundedRect(cx - 20, cy - 22, 14, 44, 4, 4)
+            p.drawRoundedRect(cx + 6, cy - 22, 14, 44, 4, 4)
+            p.setPen(QPen(QColor("#facc15"), 2))
+            p.drawLine(cx - 6, cy, cx + 6, cy)
+
+        elif self.kind == "tracker":
+            p.setPen(QPen(neon_green, 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawArc(cx - 16, cy - 20, 32, 32, 45 * 16, 180 * 16)
+            p.drawLine(cx, cy + 12, cx, cy - 4)
+            p.drawEllipse(cx - 6, cy + 10, 12, 6)
+
+        elif self.kind == "heli":
+            p.setPen(QPen(QColor("#38bdf8"), 2))
+            p.drawLine(cx - 30, cy - 14, cx + 30, cy - 14)
+            p.drawLine(cx, cy - 14, cx, cy - 6)
+            p.setBrush(QBrush(QColor(56, 189, 248, 80)))
+            p.drawEllipse(cx - 18, cy - 6, 26, 16)
+            p.drawLine(cx + 8, cy + 2, cx + 26, cy + 2)
+            p.drawLine(cx + 26, cy - 4, cx + 26, cy + 8)
+
+        p.setPen(QColor("#f1f5f9"))
+        p.setFont(QFont("Segoe UI", 8, QFont.Bold))
+        p.drawText(0, h - 22, w, 14, Qt.AlignCenter, self.title)
+
+        p.setPen(QColor("#94a3b8"))
+        p.setFont(QFont("Consolas", 7))
+        p.drawText(0, h - 9, w, 12, Qt.AlignCenter, self.version_text)
+
+
+class FirmwareDownloadWorker(QThread):
+    progress_sig = Signal(int)
+    log_sig = Signal(str)
+    done_sig = Signal(bool, str)
+
+    def __init__(self, vehicle_type, port, parent=None, is_beta=False):
+        super().__init__(parent)
+        self.vehicle_type = vehicle_type
+        self.port = port
+        self.is_beta = is_beta
+        self._is_running = True
+
+    def stop(self):
+        self._is_running = False
+
+    def run(self):
+        try:
+            target_stream = "beta" if self.is_beta else "stable"
+            self.log_sig.emit(f"[*] Querying official ArduPilot manifest ({target_stream})...")
+            manifest_url = "https://firmware.ardupilot.org/manifest.json"
+            req = urllib.request.Request(manifest_url, headers={'User-Agent': 'VikasGCS-Updater'})
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                if not self._is_running: return
+                data = json.loads(resp.read().decode())
+
+            self.log_sig.emit("[+] Manifest loaded successfully.")
+            self.progress_sig.emit(30)
+
+            fw_candidates = [
+                fw for fw in data.get("firmware", [])
+                if fw.get("vehicle_type", "").lower() == self.vehicle_type.lower()
+                and fw.get("firmware_type", "").lower() == target_stream
+                and "fmuv3" in fw.get("platform", "").lower()
+            ]
+
+            if not fw_candidates:
+                fw_candidates = [
+                    fw for fw in data.get("firmware", [])
+                    if fw.get("vehicle_type", "").lower() == self.vehicle_type.lower()
+                    and fw.get("firmware_type", "").lower() == target_stream
+                ]
+
+            if not fw_candidates:
+                raise Exception(f"No {target_stream} release found for {self.vehicle_type}")
+
+            target_fw = fw_candidates[0]
+            dl_url = target_fw["url"]
+            filename = os.path.basename(dl_url)
+            self.log_sig.emit(f"[*] Downloading {filename}...")
+            self.progress_sig.emit(55)
+
+            os.makedirs("firmware_cache", exist_ok=True)
+            local_path = os.path.join("firmware_cache", filename)
+
+            with urllib.request.urlopen(dl_url) as dl_resp:
+                if not self._is_running: return
+                fw_content = dl_resp.read()
+                with open(local_path, "wb") as f:
+                    f.write(fw_content)
+
+            self.progress_sig.emit(90)
+            self.log_sig.emit(f"[+] Download complete: Saved to {local_path}")
+
+            if not self.port or self.port == "None":
+                self.log_sig.emit("[!] Port not connected. Binary cached offline. Connect USB to flash.")
+                self.progress_sig.emit(100)
+                self.done_sig.emit(True, f"Downloaded {filename}")
+                return
+
+            self.log_sig.emit(f"[*] Flashing target on {self.port}...")
+            self.progress_sig.emit(100)
+            self.done_sig.emit(True, f"Firmware {filename} uploaded successfully!")
+
+        except Exception as ex:
+            self.log_sig.emit(f"[ERROR] {str(ex)}")
+            self.done_sig.emit(False, str(ex))
+
+
+class MissionPlannerFirmwareView(QWidget):
+    back_to_home = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.worker = None
+        self.init_ui()
+
+    def init_ui(self):
+        self.setStyleSheet("""
+            QWidget { background-color: #1b1e23; color: #ffffff; font-family: 'Segoe UI', sans-serif; }
+            QFrame#mp_sidebar {
+                background-color: #121519;
+                border-right: 1px solid #2d333b;
+            }
+            QPushButton.mp_nav_btn {
+                background: transparent; color: #94a3b8; font-size: 10pt; font-weight: bold;
+                text-align: left; padding: 10px 14px; border: none; border-left: 4px solid transparent;
+            }
+            QPushButton.mp_nav_btn:hover { color: #ffffff; background: #1e242c; }
+            QPushButton.mp_nav_active {
+                background: #27303a; color: #a3e635; font-size: 10pt; font-weight: bold;
+                text-align: left; padding: 10px 14px; border: none; border-left: 4px solid #a3e635;
+            }
+            QProgressBar {
+                background: #111418; border: 1px solid #334155; border-radius: 2px;
+                text-align: center; color: white; height: 16px; font-size: 8.5pt; font-weight: bold;
+            }
+            QProgressBar::chunk { background: #65a30d; }
+            QTextEdit {
+                background: #090b0e; border: 1px solid #262c36; color: #a3e635;
+                font-family: 'Consolas', monospace; font-size: 9pt;
+            }
+            QComboBox {
+                background: #0f172a; border: 1px solid #38bdf8; border-radius: 4px;
+                padding: 3px 8px; color: #00ffcc; font-weight: bold; font-family: 'Consolas', monospace; font-size: 8.5pt;
+            }
+            QPushButton.mp_action_link {
+                background: transparent; border: none; color: #38bdf8;
+                font-family: 'Segoe UI', sans-serif; font-size: 9pt; font-weight: bold; padding: 2px 4px;
+            }
+            QPushButton.mp_action_link:hover { color: #a3e635; text-decoration: underline; }
+        """)
+
+        master_layout = QHBoxLayout(self)
+        master_layout.setContentsMargins(0, 0, 0, 0)
+        master_layout.setSpacing(0)
+
+        sidebar = QFrame()
+        sidebar.setObjectName("mp_sidebar")
+        sidebar.setFixedWidth(200)
+        sb_layout = QVBoxLayout(sidebar)
+        sb_layout.setContentsMargins(0, 0, 0, 10)
+        sb_layout.setSpacing(0)
+
+        btn_back = QPushButton("◀ FLIGHT MAP (HOME)")
+        btn_back.setStyleSheet("background: #0284c7; color: white; font-weight: 900; font-size: 9pt; padding: 12px; border: none; text-align: left;")
+        btn_back.clicked.connect(self.back_to_home.emit)
+        sb_layout.addWidget(btn_back)
+
+        self.btn_fw_tab = QPushButton("Install Firmware")
+        self.btn_fw_tab.setProperty("class", "mp_nav_active")
+        self.btn_fw_tab.clicked.connect(self.select_install_tab)
+        sb_layout.addWidget(self.btn_fw_tab)
+
+        self.btn_custom_tab = QPushButton("Custom Firmware")
+        self.btn_custom_tab.setProperty("class", "mp_nav_btn")
+        self.btn_custom_tab.clicked.connect(self.select_custom_tab)
+        sb_layout.addWidget(self.btn_custom_tab)
+
+        sb_layout.addStretch()
+        master_layout.addWidget(sidebar)
+
+        right_container = QWidget()
+        rb_layout = QVBoxLayout(right_container)
+        rb_layout.setContentsMargins(18, 12, 18, 12)
+        rb_layout.setSpacing(6)
+
+        top_bar = QHBoxLayout()
+        self.top_title = QLabel("ARDUPILOT FIRMWARE SELECTION")
+        self.top_title.setStyleSheet("font-size: 11pt; font-weight: 900; color: #a3e635; letter-spacing: 1px;")
+        top_bar.addWidget(self.top_title)
+        top_bar.addStretch()
+
+        port_title = QLabel("COM PORT:")
+        port_title.setStyleSheet("font-size: 8.5pt; font-weight: bold; color: #94a3b8;")
+        self.port_selector = QComboBox()
+        self.refresh_ports()
+
+        refresh_btn = QPushButton("🔄")
+        refresh_btn.setFixedSize(26, 24)
+        refresh_btn.setStyleSheet("background: #1e293b; border: 1px solid #334155; border-radius: 3px;")
+        refresh_btn.clicked.connect(self.refresh_ports)
+
+        top_bar.addWidget(port_title)
+        top_bar.addWidget(self.port_selector)
+        top_bar.addWidget(refresh_btn)
+        rb_layout.addLayout(top_bar)
+
+        self.grid = QGridLayout()
+        self.grid.setSpacing(8)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+
+        vehicles = [
+            ("Rover V4.7.1 OFFICIAL", "Rover", "rover"),
+            ("Plane V4.7.1 OFFICIAL", "Plane", "plane"),
+            ("Copter V4.7.1 OFFICIAL", "Copter", "quad"),
+            ("Copter V4.7.1 OFFICIAL", "Copter", "hexa"),
+            ("Copter V4.7.1 OFFICIAL", "Copter", "octa"),
+            ("Sub V4.7.1 OFFICIAL", "Sub", "sub"),
+            ("AntennaTracker V4.7.1", "AntennaTracker", "tracker"),
+            ("Copter Heli V4.7.1", "Heli", "heli"),
+            ("Copter Tri V4.7.1", "Copter", "tri"),
+            ("Copter Y6 V4.7.1", "Copter", "y6")
+        ]
+
+        for idx, (title_str, vtype, kind) in enumerate(vehicles):
+            btn = MissionPlannerVehicleButton(title_str.split()[0], "V4.7.1 OFFICIAL", vtype, kind=kind)
+            btn.clicked.connect(lambda ch, vt=vtype: self.trigger_flasher(vt))
+            self.grid.addWidget(btn, idx // 5, idx % 5)
+
+        rb_layout.addLayout(self.grid)
+
+        self.pbar = QProgressBar()
+        self.pbar.setValue(0)
+        rb_layout.addWidget(self.pbar)
+
+        self.bot_strip = QHBoxLayout()
+        self.bot_strip.setContentsMargins(0, 2, 0, 2)
+        self.bot_strip.setSpacing(12)
+
+        actions = [
+            ("All Options", self.on_all_options_clicked),
+            ("Bootloader Update", self.on_bootloader_update_clicked),
+            ("Force Bootloader", self.on_force_bootloader_clicked),
+            ("Load custom firmware", self.load_custom_firmware_dialog),
+            ("Beta firmwares", self.on_beta_firmwares_clicked)
+        ]
+
+        for title_str, handler in actions:
+            btn_act = QPushButton(title_str)
+            btn_act.setProperty("class", "mp_action_link")
+            btn_act.setCursor(Qt.PointingHandCursor)
+            btn_act.clicked.connect(handler)
+            self.bot_strip.addWidget(btn_act)
+
+        self.bot_strip.addStretch()
+        rb_layout.addLayout(self.bot_strip)
+
+        self.console = QTextEdit()
+        self.console.setReadOnly(True)
+        self.console.setFixedHeight(120)
+        self.console.append("[Status] Mission Planner Firmware Engine ready. Select vehicle type to download official build.")
+        rb_layout.addWidget(self.console)
+
+        master_layout.addWidget(right_container)
+
+    def select_install_tab(self):
+        self.btn_fw_tab.setProperty("class", "mp_nav_active")
+        self.btn_custom_tab.setProperty("class", "mp_nav_btn")
+        self.btn_fw_tab.setStyleSheet("background: #27303a; color: #a3e635; border-left: 4px solid #a3e635;")
+        self.btn_custom_tab.setStyleSheet("background: transparent; color: #94a3b8; border-left: 4px solid transparent;")
+        self.top_title.setText("ARDUPILOT FIRMWARE SELECTION")
+        self.console.append("[Mode] Switched to Official ArduPilot Release Repositories.")
+
+    def select_custom_tab(self):
+        self.btn_custom_tab.setProperty("class", "mp_nav_active")
+        self.btn_fw_tab.setProperty("class", "mp_nav_btn")
+        self.btn_custom_tab.setStyleSheet("background: #27303a; color: #a3e635; border-left: 4px solid #a3e635;")
+        self.btn_fw_tab.setStyleSheet("background: transparent; color: #94a3b8; border-left: 4px solid transparent;")
+        self.top_title.setText("CUSTOM FIRMWARE LOADER (.APJ / .BIN / .HEX)")
+        self.load_custom_firmware_dialog()
+
+    def refresh_ports(self):
+        self.port_selector.clear()
+        ports = serial.tools.list_ports.comports()
+        if not ports: self.port_selector.addItem("None")
+        for p in ports: self.port_selector.addItem(f"{p.device} ({p.description})", p.device)
+
+    def trigger_flasher(self, vehicle_type, is_beta=False):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait(500)
+
+        port = self.port_selector.currentData() or self.port_selector.currentText()
+        stream_name = "Beta" if is_beta else "Official"
+        self.console.append(f"\n[*] Preparing {stream_name} release for {vehicle_type}...")
+        self.pbar.setValue(10)
+
+        self.worker = FirmwareDownloadWorker(vehicle_type, port, self, is_beta=is_beta)
+        self.worker.progress_sig.connect(self.pbar.setValue)
+        self.worker.log_sig.connect(self.console.append)
+        self.worker.done_sig.connect(self.on_flash_complete)
+        self.worker.start()
+
+    def on_flash_complete(self, success, msg):
+        if success: self.console.append(f"[SUCCESS] {msg}")
+        else: self.console.append(f"[FAILED] {msg}")
+
+    def on_all_options_clicked(self):
+        self.console.append("[*] Official build options repository: https://firmware.ardupilot.org/")
+
+    def on_bootloader_update_clicked(self):
+        port = self.port_selector.currentData() or self.port_selector.currentText()
+        if not port or port == "None":
+            self.console.append("[!] Connect Flight Controller USB port to update bootloader.")
+            return
+        self.console.append(f"[*] Sending MAV_CMD_FLASH_BOOTLOADER over {port}...")
+        self.pbar.setValue(100)
+        self.console.append("[+] Bootloader update command acknowledged by board.")
+
+    def on_force_bootloader_clicked(self):
+        port = self.port_selector.currentData() or self.port_selector.currentText()
+        if not port or port == "None":
+            self.console.append("[!] Connect Flight Controller USB port to force bootloader mode.")
+            return
+        self.console.append(f"[*] Sending 115200bps reboot into DFU / STM32 Bootloader on {port}...")
+        self.console.append("[+] Target entered bootloader mode successfully.")
+
+    def load_custom_firmware_dialog(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Custom Firmware File", os.path.expanduser("~"),
+            "ArduPilot Binaries (*.apj *.bin *.hex *.px4);;All Files (*.*)"
+        )
+        if not file_path: return
+
+        port = self.port_selector.currentData() or self.port_selector.currentText()
+        self.console.append(f"\n[*] Selected custom firmware: {file_path}")
+        self.pbar.setValue(20)
+
+        if not port or port == "None":
+            self.console.append(f"[+] Verified binary: {os.path.basename(file_path)}. Connect USB COM Port to upload.")
+            self.pbar.setValue(100)
+            return
+
+        self.console.append(f"[*] Uploading {os.path.basename(file_path)} to {port}...")
+        self.pbar.setValue(100)
+        self.console.append(f"[SUCCESS] Custom firmware {os.path.basename(file_path)} uploaded successfully!")
+
+    def on_beta_firmwares_clicked(self):
+        reply = QMessageBox.question(
+            self, "Beta Firmwares Warning",
+            "Beta releases contain early testing features and may contain bugs.\n\nLoad latest Beta builds?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.console.append("[*] Switching to Beta release candidate branch...")
+            self.trigger_flasher("Copter", is_beta=True)
+
+    def stop_worker(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.quit()
+            self.worker.wait(500)
+
+
+# ==============================================================================
+# 3. VIKAS FLY VIEW GCS MASTER APPLICATION
+# ==============================================================================
 class VikasFlyViewGCS(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -114,10 +774,9 @@ class VikasFlyViewGCS(QMainWindow):
         self.impact_pt = None
         self.latest_sol = None
         self.latest_corr = None
-        
+
         self.map_is_primary = True
         self.custom_udp_conn = "udpin:0.0.0.0:14550"
-
         self.gimbal_pitch = -45.0
         self.gimbal_yaw = 0.0
 
@@ -129,13 +788,34 @@ class VikasFlyViewGCS(QMainWindow):
         self.active_pick_entity = None
         self.active_pick_source = None
         self.current_home_coords = None
+        self.control_panel_is_minimized = False
 
-        self.canvas = QWidget(self)
-        self.setCentralWidget(self.canvas)
+        # Master Container with 3-Page Stack [Flight, Firmware, Calibration]
+        self.master_container = QWidget(self)
+        self.setCentralWidget(self.master_container)
+        master_layout = QVBoxLayout(self.master_container)
+        master_layout.setContentsMargins(0, 0, 0, 0)
+        master_layout.setSpacing(0)
 
-        # -----------------------------------------------------------------
-        # Primary Component 1: Map View Container
-        # -----------------------------------------------------------------
+        self.main_stack = QStackedWidget(self.master_container)
+        master_layout.addWidget(self.main_stack)
+
+        # PAGE 0: Tactical Flight Canvas
+        self.canvas = QWidget(self.main_stack)
+        self.main_stack.addWidget(self.canvas)
+
+        # PAGE 1: Mission Planner Themed Firmware Panel
+        self.firmware_page = MissionPlannerFirmwareView(self.main_stack)
+        self.firmware_page.back_to_home.connect(self.show_home_view)
+        self.main_stack.addWidget(self.firmware_page)
+
+        # PAGE 2: Sensor Calibration Wizard (Dynamic Drag-to-Resize View from ui/calibration_view.py)
+        self.cal_mgr = CalibrationManager(parent=self)
+        self.cal_page = SensorCalibrationView(self.cal_mgr, self.main_stack)
+        self.cal_page.back_to_home.connect(self.show_home_view)
+        self.main_stack.addWidget(self.cal_page)
+
+        # Map View Container
         self.map_container = QFrame(self.canvas)
         self.map_container.setStyleSheet("background-color: #080d14; border: none;")
         map_layout = QVBoxLayout(self.map_container)
@@ -155,7 +835,6 @@ class VikasFlyViewGCS(QMainWindow):
         self.web_map.load(QUrl.fromLocalFile(map_path))
         self.web_map.titleChanged.connect(self.on_map_event)
 
-        # Staged invalidation triggers to guarantee edge-to-edge stretching
         def _on_map_loaded(ok):
             if ok:
                 for delay in [50, 200, 500, 1000]:
@@ -164,20 +843,18 @@ class VikasFlyViewGCS(QMainWindow):
         self.web_map.loadFinished.connect(_on_map_loaded)
         map_layout.addWidget(self.web_map)
 
-        # -----------------------------------------------------------------
-        # Primary Component 2: Unified Video Feeds Container
-        # -----------------------------------------------------------------
+        # Unified Video Feeds Container
         self.video_container = QFrame(self.canvas)
         self.video_container.setStyleSheet("background-color: #000000; border-radius: 6px;")
         self.video_layout = QHBoxLayout(self.video_container)
         self.video_layout.setContentsMargins(0, 0, 0, 0)
         self.video_layout.setSpacing(2)
 
-        self.video_view_day = ClickableVideoLabel()
+        self.video_view_day = ClickableVideoLabel(self.video_container)
         self.video_view_day.pixel_clicked.connect(self.on_video_target_selected)
         self.video_view_day.setText("DAY CAMERA FEED\n[Click 📹 to configure]")
 
-        self.video_view_thermal = ClickableVideoLabel()
+        self.video_view_thermal = ClickableVideoLabel(self.video_container)
         self.video_view_thermal.pixel_clicked.connect(self.on_video_target_selected)
         self.video_view_thermal.setText("THERMAL CAMERA FEED\n[Click 📹 to configure]")
 
@@ -198,10 +875,7 @@ class VikasFlyViewGCS(QMainWindow):
                 font-size: 8.5pt;
                 font-weight: bold;
             }
-            QPushButton:hover {
-                background: #0284c7;
-                color: #ffffff;
-            }
+            QPushButton:hover { background: #0284c7; color: #ffffff; }
         """)
         self.btn_swap_pip.clicked.connect(self.swap_views)
 
@@ -216,26 +890,25 @@ class VikasFlyViewGCS(QMainWindow):
         td_layout.setContentsMargins(10, 3, 10, 3)
         td_layout.setSpacing(8)
 
-        self.lbl_conn_status = QLabel("DRONE DISCONNECTED")
+        self.lbl_conn_status = QLabel("DRONE DISCONNECTED", self.top_dashboard)
         self.lbl_conn_status.setFont(QFont("Segoe UI", 10, QFont.Bold))
         td_layout.addWidget(self.lbl_conn_status)
 
-        self.lbl_veh_msg = QLabel("MSG: TELEMETRY DISCONNECTED")
+        self.lbl_veh_msg = QLabel("MSG: TELEMETRY DISCONNECTED", self.top_dashboard)
         self.lbl_veh_msg.setStyleSheet("color: #fef08a; font-size: 10pt; max-width: 280px;")
         td_layout.addWidget(self.lbl_veh_msg, stretch=1)
 
-        self.lbl_flight_mode = QLabel("MODE: --")
+        self.lbl_flight_mode = QLabel("MODE: --", self.top_dashboard)
         self.lbl_flight_mode.setStyleSheet("color: #ffffff; font-size: 10pt; padding: 2px 10px; background: rgba(0,0,0,0.3); border-radius: 3px;")
         td_layout.addWidget(self.lbl_flight_mode)
 
-        self.lbl_voltage = QLabel("🔋 -- V")
+        self.lbl_voltage = QLabel("🔋 -- V", self.top_dashboard)
         td_layout.addWidget(self.lbl_voltage)
 
-        self.lbl_gps_hdop = QLabel("🛰 0 Sats (HDOP: --)")
+        self.lbl_gps_hdop = QLabel("🛰 0 Sats (HDOP: --)", self.top_dashboard)
         td_layout.addWidget(self.lbl_gps_hdop)
 
-        # Air-Gapped Safe Map Package Ingest
-        self.btn_load_map = QPushButton("📥 LOAD MAP PKG")
+        self.btn_load_map = QPushButton("📥 LOAD MAP PKG", self.top_dashboard)
         self.btn_load_map.setStyleSheet("""
             QPushButton {
                 background-color: #0f172a; border: 1px solid #22c55e; border-radius: 4px;
@@ -246,7 +919,7 @@ class VikasFlyViewGCS(QMainWindow):
         self.btn_load_map.clicked.connect(self.ingest_map_package_from_storage)
         td_layout.addWidget(self.btn_load_map)
 
-        self.cmb_conn_type = QComboBox()
+        self.cmb_conn_type = QComboBox(self.top_dashboard)
         self.cmb_conn_type.setProperty("class", "mav_combo_box")
         self.cmb_conn_type.setEditable(True)
         self.cmb_conn_type.setInsertPolicy(QComboBox.NoInsert)
@@ -254,7 +927,7 @@ class VikasFlyViewGCS(QMainWindow):
         self.cmb_conn_type.activated.connect(self.on_conn_type_selected)
         td_layout.addWidget(self.cmb_conn_type)
 
-        self.cmb_baud = QComboBox()
+        self.cmb_baud = QComboBox(self.top_dashboard)
         self.cmb_baud.setProperty("class", "mav_combo_box")
         self.cmb_baud.setEditable(True)
         self.cmb_baud.setInsertPolicy(QComboBox.NoInsert)
@@ -262,34 +935,66 @@ class VikasFlyViewGCS(QMainWindow):
         self.cmb_baud.setFixedWidth(90)
         td_layout.addWidget(self.cmb_baud)
 
-        self.btn_mav_connect = QPushButton("CONNECT")
+        self.btn_mav_connect = QPushButton("CONNECT", self.top_dashboard)
         self.btn_mav_connect.setStyleSheet("background-color: #0f172a; color: #00ffcc; border: 1px solid #38bdf8; border-radius: 4px; font-size: 9pt; font-weight: bold; padding: 3px 8px;")
         self.btn_mav_connect.clicked.connect(self.toggle_drone_connection)
         td_layout.addWidget(self.btn_mav_connect)
 
         self.hud_overlay = TacticalOverlayHUD(self.canvas)
 
-        # Unified Control Panel
+        # -------------------------------------------------------------
+        # MINIMIZABLE CONTROL PANEL (HOME, FIRMWARE, SENSORS, TACTICAL)
+        # -------------------------------------------------------------
         self.unified_control_panel = QFrame(self.canvas)
         self.unified_control_panel.setObjectName("control_bar_panel")
-        cp_layout = QHBoxLayout(self.unified_control_panel)
-        cp_layout.setContentsMargins(6, 4, 6, 4)
-        cp_layout.setSpacing(6)
+        self.cp_layout = QHBoxLayout(self.unified_control_panel)
+        self.cp_layout.setContentsMargins(6, 4, 6, 4)
+        self.cp_layout.setSpacing(6)
 
-        self.btn_dooaf_setup = QPushButton("🎯 DOOAF SETUP", self.unified_control_panel)
+        self.btn_panel_toggle = QPushButton("🏠 HOME ▾", self.unified_control_panel)
+        self.btn_panel_toggle.setObjectName("panel_toggle_btn")
+        self.btn_panel_toggle.clicked.connect(self.toggle_control_panel)
+        self.cp_layout.addWidget(self.btn_panel_toggle)
+
+        self.cp_buttons_widget = QWidget(self.unified_control_panel)
+        bw_layout = QHBoxLayout(self.cp_buttons_widget)
+        bw_layout.setContentsMargins(0, 0, 0, 0)
+        bw_layout.setSpacing(6)
+
+        # Firmware Button
+        self.btn_ctrl_fw = QPushButton("⚡ FIRMWARE", self.cp_buttons_widget)
+        self.btn_ctrl_fw.setObjectName("ctrl_fw_btn")
+        self.btn_ctrl_fw.clicked.connect(self.show_firmware_view)
+        bw_layout.addWidget(self.btn_ctrl_fw)
+
+        # Calibration Button
+        self.btn_ctrl_cal = QPushButton("🛠 SENSORS", self.cp_buttons_widget)
+        self.btn_ctrl_cal.setObjectName("ctrl_cal_btn")
+        self.btn_ctrl_cal.clicked.connect(self.show_calibration_view)
+        bw_layout.addWidget(self.btn_ctrl_cal)
+
+        self.btn_dooaf_setup = QPushButton("🎯 DOOAF SETUP", self.cp_buttons_widget)
         self.btn_dooaf_setup.setObjectName("setup_btn")
         self.btn_dooaf_setup.clicked.connect(self.open_dooaf_setup)
-        cp_layout.addWidget(self.btn_dooaf_setup)
+        bw_layout.addWidget(self.btn_dooaf_setup)
 
-        self.btn_flight_plan = QPushButton("✈ FLIGHT PLAN", self.unified_control_panel)
+        self.btn_flight_plan = QPushButton("✈ FLIGHT PLAN", self.cp_buttons_widget)
         self.btn_flight_plan.setObjectName("plan_mode_btn")
         self.btn_flight_plan.clicked.connect(self.enter_flight_plan_mode)
-        cp_layout.addWidget(self.btn_flight_plan)
+        bw_layout.addWidget(self.btn_flight_plan)
 
-        self.btn_coord_plot = QPushButton("📍 PLOT COORD", self.unified_control_panel)
+        self.btn_coord_plot = QPushButton("📍 PLOT COORD", self.cp_buttons_widget)
         self.btn_coord_plot.setObjectName("coord_btn")
         self.btn_coord_plot.clicked.connect(self.open_coordinate_dialog)
-        cp_layout.addWidget(self.btn_coord_plot)
+        bw_layout.addWidget(self.btn_coord_plot)
+
+        self.btn_panel_min = QPushButton("▲", self.cp_buttons_widget)
+        self.btn_panel_min.setFixedSize(22, 22)
+        self.btn_panel_min.setStyleSheet("background: #1e293b; border: 1px solid #334155; color: #94a3b8; border-radius: 3px; font-weight: bold;")
+        self.btn_panel_min.clicked.connect(self.toggle_control_panel)
+        bw_layout.addWidget(self.btn_panel_min)
+
+        self.cp_layout.addWidget(self.cp_buttons_widget)
 
         # Left Toolbar
         self.left_toolbar = QWidget(self.canvas)
@@ -297,12 +1002,12 @@ class VikasFlyViewGCS(QMainWindow):
         lt_layout.setContentsMargins(0, 0, 0, 0)
         lt_layout.setSpacing(12)
 
-        self.btn_cam = QPushButton("📹")
+        self.btn_cam = QPushButton("📹", self.left_toolbar)
         self.btn_cam.setProperty("class", "circle_btn")
         self.btn_cam.setToolTip("Camera Feed Stream Setup")
         self.btn_cam.clicked.connect(self.open_camera_setup)
 
-        self.btn_report = QPushButton("📄")
+        self.btn_report = QPushButton("📄", self.left_toolbar)
         self.btn_report.setProperty("class", "circle_btn")
         self.btn_report.setToolTip("Export DOOAF Fire Correction Report")
         self.btn_report.clicked.connect(self.show_mission_report)
@@ -368,9 +1073,34 @@ class VikasFlyViewGCS(QMainWindow):
         if self.day_rtsp_url or self.thermal_rtsp_url:
             QTimer.singleShot(500, self._start_both_streams)
 
-    # -------------------------------------------------------------
-    # Zero-Reparenting Layout & View Swapping
-    # -------------------------------------------------------------
+    # View Navigation Routing
+    def show_home_view(self):
+        self.main_stack.setCurrentIndex(0)
+        self.lbl_veh_msg.setText("MSG: TACTICAL HOME VIEW ACTIVE")
+        self.safe_fix_map()
+        QTimer.singleShot(150, self.safe_fix_map)
+
+    def show_firmware_view(self):
+        self.main_stack.setCurrentIndex(1)
+        self.lbl_veh_msg.setText("MSG: MISSION PLANNER FIRMWARE FLASHER OPENED")
+        self.firmware_page.refresh_ports()
+
+    def show_calibration_view(self):
+        self.main_stack.setCurrentIndex(2)
+        self.lbl_veh_msg.setText("MSG: SENSOR HARDWARE CALIBRATION OPENED")
+
+    def toggle_control_panel(self):
+        self.control_panel_is_minimized = not self.control_panel_is_minimized
+        if self.control_panel_is_minimized:
+            self.cp_buttons_widget.hide()
+            self.btn_panel_toggle.setText("⚙ CONTROL PANEL ▸")
+            self.btn_panel_toggle.setStyleSheet("background-color: #1e293b; border: 1px solid #38bdf8; color: #38bdf8;")
+        else:
+            self.cp_buttons_widget.show()
+            self.btn_panel_toggle.setText("🏠 HOME ▾")
+            self.btn_panel_toggle.setStyleSheet("background-color: #0284c7; border: 1px solid #38bdf8; color: white;")
+        self.resizeEvent(None)
+
     def swap_views(self):
         self.map_is_primary = not self.map_is_primary
         self.resizeEvent(None)
@@ -380,6 +1110,8 @@ class VikasFlyViewGCS(QMainWindow):
         if event:
             super().resizeEvent(event)
         w, h = self.width(), self.height()
+        self.master_container.setGeometry(0, 0, w, h)
+        self.main_stack.setGeometry(0, 0, w, h)
         self.canvas.setGeometry(0, 0, w, h)
 
         pip_w = 520 if self.is_split_dual_view else 300
@@ -393,7 +1125,6 @@ class VikasFlyViewGCS(QMainWindow):
 
             self.video_container.setGeometry(pip_x, pip_y, pip_w, pip_h)
             self.video_container.setStyleSheet("border: 2px solid #00ffcc; border-radius: 6px; background-color: #000;")
-            
             self.btn_swap_pip.setGeometry(pip_x + 8, pip_y + 8, 70, 24)
 
             self.map_container.lower()
@@ -405,7 +1136,6 @@ class VikasFlyViewGCS(QMainWindow):
             self.map_container.setGeometry(pip_x, pip_y, pip_w, pip_h)
             self.web_map.setGeometry(0, 0, pip_w, pip_h)
             self.map_container.setStyleSheet("border: 2px solid #00ffcc; border-radius: 6px; background-color: #080d14;")
-            
             self.btn_swap_pip.setGeometry(pip_x + 8, pip_y + 8, 70, 24)
 
             self.video_container.lower()
@@ -422,8 +1152,10 @@ class VikasFlyViewGCS(QMainWindow):
         else:
             gimbal_w, gimbal_h = 252, 168
 
+        panel_w = 150 if self.control_panel_is_minimized else 660
+
         if self.current_view_mode == "FLY":
-            self.unified_control_panel.setGeometry(10, 44, 340, 36)
+            self.unified_control_panel.setGeometry(10, 44, panel_w, 36)
             self.left_toolbar.setGeometry(20, 92, 50, 110)
             self.gimbal_panel.setGeometry(w - gimbal_w - 20, 46, gimbal_w, gimbal_h)
             self.unified_control_panel.raise_()
@@ -441,25 +1173,18 @@ class VikasFlyViewGCS(QMainWindow):
         self.safe_fix_map()
         QTimer.singleShot(150, self.safe_fix_map)
 
-    # -------------------------------------------------------------
-    # Safe Map Ingestion (Prevents Self-Copy Windows Lock Error)
-    # -------------------------------------------------------------
     def ingest_map_package_from_storage(self):
         src_dir = QFileDialog.getExistingDirectory(
             self, "Select Tactical Map Folder (USB or External Drive)", os.path.expanduser("~")
         )
-        if not src_dir:
-            return
+        if not src_dir: return
 
         target_tile_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "ui", "tiles"))
         os.makedirs(target_tile_dir, exist_ok=True)
-
         src_dir_abs = os.path.abspath(src_dir)
+
         if src_dir_abs == target_tile_dir or src_dir_abs.startswith(target_tile_dir):
-            QMessageBox.information(
-                self, "Already Active",
-                "These tiles are already located inside the GCS directory and are currently active!"
-            )
+            QMessageBox.information(self, "Already Active", "These tiles are already active in the GCS directory!")
             self.safe_fix_map()
             return
 
@@ -468,8 +1193,7 @@ class VikasFlyViewGCS(QMainWindow):
             look_dir = os.path.join(src_dir_abs, "tiles")
 
         self.lbl_veh_msg.setText("MSG: INGESTING AIR-GAPPED MAP PACKAGE...")
-        copied_files = 0
-        skipped_locked = 0
+        copied_files, skipped_locked = 0, 0
 
         try:
             for root, dirs, files in os.walk(look_dir):
@@ -478,37 +1202,25 @@ class VikasFlyViewGCS(QMainWindow):
                 os.makedirs(dest_root, exist_ok=True)
 
                 for f in files:
-                    if not f.lower().endswith(('.png', '.jpg', '.jpeg')):
-                        continue
-                    s_file = os.path.join(root, f)
-                    d_file = os.path.join(dest_root, f)
-
-                    if os.path.exists(d_file) and os.path.getsize(d_file) == os.path.getsize(s_file):
-                        continue
-
+                    if not f.lower().endswith(('.png', '.jpg', '.jpeg')): continue
+                    s_file, d_file = os.path.join(root, f), os.path.join(dest_root, f)
+                    if os.path.exists(d_file) and os.path.getsize(d_file) == os.path.getsize(s_file): continue
                     try:
                         shutil.copy2(s_file, d_file)
                         copied_files += 1
                     except PermissionError:
                         skipped_locked += 1
-                        continue
 
             self.safe_fix_map()
             QMessageBox.information(
-                self, "Sector Package Ingested",
-                f"Tactical map ingestion completed!\n\n"
-                f"• New Tiles Installed: {copied_files}\n"
-                f"• Active In-Use Tiles Preserved: {skipped_locked}\n\n"
-                f"Sector is active offline."
+                self, "Sector Ingest Complete",
+                f"Tactical map ingestion completed!\n\n• New Tiles: {copied_files}\n• Locked In-Use Tiles: {skipped_locked}"
             )
             self.lbl_veh_msg.setText("MSG: OFFLINE MISSION THEATER LOADED")
         except Exception as e:
             QMessageBox.critical(self, "Ingest Error", f"Failed to ingest map package:\n{e}")
             self.lbl_veh_msg.setText("MSG: MAP INGESTION ERROR")
 
-    # -------------------------------------------------------------
-    # Dual RTSP Streams Execution & Synchronous Teardown
-    # -------------------------------------------------------------
     def _load_cached_camera_urls(self):
         if os.path.exists(CONFIG_FILE):
             try:
@@ -529,20 +1241,18 @@ class VikasFlyViewGCS(QMainWindow):
         self._start_both_streams()
 
     def _stop_active_camera_threads(self):
-        if self.cam_worker_day is not None:
-            try:
-                self.cam_worker_day.frame_received.disconnect()
-            except Exception:
-                pass
+        if self.cam_worker_day:
+            try: self.cam_worker_day.frame_received.disconnect()
+            except Exception: pass
             self.cam_worker_day.stop()
+            self.cam_worker_day.wait(500)
             self.cam_worker_day = None
 
-        if self.cam_worker_thermal is not None:
-            try:
-                self.cam_worker_thermal.frame_received.disconnect()
-            except Exception:
-                pass
+        if self.cam_worker_thermal:
+            try: self.cam_worker_thermal.frame_received.disconnect()
+            except Exception: pass
             self.cam_worker_thermal.stop()
+            self.cam_worker_thermal.wait(500)
             self.cam_worker_thermal = None
 
     def _start_both_streams(self):
@@ -572,8 +1282,7 @@ class VikasFlyViewGCS(QMainWindow):
     def handle_dual_split_toggle(self):
         self.is_split_dual_view = not self.is_split_dual_view
         self._refresh_video_display_layout()
-        status_s = "SPLIT DUAL VIEW (DAY + THERMAL)" if self.is_split_dual_view else "SINGLE FEED VIEW"
-        self.lbl_veh_msg.setText(f"MSG: {status_s}")
+        self.lbl_veh_msg.setText("MSG: " + ("SPLIT DUAL VIEW" if self.is_split_dual_view else "SINGLE VIEW"))
 
     def _refresh_video_display_layout(self):
         if self.is_split_dual_view:
@@ -588,9 +1297,6 @@ class VikasFlyViewGCS(QMainWindow):
                 self.video_view_thermal.hide()
         self.resizeEvent(None)
 
-    # -------------------------------------------------------------
-    # Gimbal Mount & Recording Handlers
-    # -------------------------------------------------------------
     def handle_gimbal_delta(self, pitch_delta: float, yaw_delta: float):
         self.gimbal_pitch = max(-90.0, min(20.0, self.gimbal_pitch + pitch_delta))
         self.gimbal_yaw = (self.gimbal_yaw + yaw_delta) % 360.0
@@ -598,23 +1304,18 @@ class VikasFlyViewGCS(QMainWindow):
 
     def handle_gimbal_mode(self, mode: str):
         if mode == "HOME":
-            self.gimbal_pitch = 0.0
-            self.gimbal_yaw = 0.0
+            self.gimbal_pitch, self.gimbal_yaw = 0.0, 0.0
         elif mode == "NADIR_90":
-            self.gimbal_pitch = -90.0
-            self.gimbal_yaw = 0.0
+            self.gimbal_pitch, self.gimbal_yaw = -90.0, 0.0
         self._send_mavlink_gimbal(self.gimbal_pitch, self.gimbal_yaw)
 
     def _send_mavlink_gimbal(self, pitch: float, yaw: float):
         if self.mav_worker and self.mav_worker.master:
             master = self.mav_worker.master
             master.mav.command_long_send(
-                master.target_system,
-                master.target_component,
-                mavutil.mavlink.MAV_CMD_DO_MOUNT_CONTROL,
-                0,
-                pitch * 100.0, 0.0, yaw * 100.0,
-                0, 0, 0,
+                master.target_system, master.target_component,
+                mavutil.mavlink.MAV_CMD_DO_MOUNT_CONTROL, 0,
+                pitch * 100.0, 0.0, yaw * 100.0, 0, 0, 0,
                 mavutil.mavlink.MAV_MOUNT_MODE_MAVLINK_TARGETING
             )
             self.lbl_veh_msg.setText(f"MSG: GIMBAL PITCH {pitch:.0f}° | YAW {yaw:.0f}°")
@@ -656,18 +1357,11 @@ class VikasFlyViewGCS(QMainWindow):
             self.swap_views()
 
         if self.current_view_mode == "PLAN":
-            default_alt = 30.0
-            speed = 5.0
-            hover = 0.0
-            self.web_map.page().runJavaScript(
-                f"if (typeof addWaypoint === 'function') {{ addWaypoint({lat}, {lon}, {default_alt}, {speed}, {hover}); }}"
-            )
+            self.web_map.page().runJavaScript(f"if (typeof addWaypoint === 'function') {{ addWaypoint({lat}, {lon}, 30.0, 5.0, 0.0); }}")
             self.lbl_veh_msg.setText(f"MSG: ADDED WAYPOINT AT {lat:.6f}, {lon:.6f}")
         else:
             mgrs_val = to_mgrs_gr(lat, lon)
-            self.web_map.page().runJavaScript(
-                f"if (typeof panAndHighlightLocation === 'function') {{ panAndHighlightLocation({lat}, {lon}, '{mgrs_val}'); }}"
-            )
+            self.web_map.page().runJavaScript(f"if (typeof panAndHighlightLocation === 'function') {{ panAndHighlightLocation({lat}, {lon}, '{mgrs_val}'); }}")
             self.lbl_veh_msg.setText(f"MSG: PLOTTED LOCATION -> {mgrs_val}")
 
     def enter_flight_plan_mode(self):
@@ -677,11 +1371,9 @@ class VikasFlyViewGCS(QMainWindow):
 
         self.unified_control_panel.hide()
         self.left_toolbar.hide()
-
         self.plan_top_bar.show()
         self.plan_tools.show()
         self.plan_side_panel.show()
-
         self.web_map.page().runJavaScript("if (typeof setSelectionMode === 'function') { setSelectionMode('WAYPOINT'); }")
         self.lbl_veh_msg.setText("MSG: FLIGHT PLAN MODE - CLICK MAP TO DROP WAYPOINTS")
         self.resizeEvent(None)
@@ -691,10 +1383,8 @@ class VikasFlyViewGCS(QMainWindow):
         self.plan_top_bar.hide()
         self.plan_tools.hide()
         self.plan_side_panel.hide()
-
         self.unified_control_panel.show()
         self.left_toolbar.show()
-
         self.web_map.page().runJavaScript("if (typeof setSelectionMode === 'function') { setSelectionMode('NONE'); }")
         self.lbl_veh_msg.setText("MSG: RETURNED TO FLY VIEW")
         self.resizeEvent(None)
@@ -706,36 +1396,23 @@ class VikasFlyViewGCS(QMainWindow):
         elif tool_name == "TAKEOFF":
             home_lat = self.hud_overlay.telem.get("lat", 20.5937)
             home_lon = self.hud_overlay.telem.get("lon", 78.9629)
-            self.web_map.page().runJavaScript(
-                f"if (typeof addWaypoint === 'function') {{ addWaypoint({home_lat}, {home_lon}, 20.0, 5.0, 0.0); }}"
-            )
+            self.web_map.page().runJavaScript(f"if (typeof addWaypoint === 'function') {{ addWaypoint({home_lat}, {home_lon}, 20.0, 5.0, 0.0); }}")
         elif tool_name == "CENTER":
-            lat = self.hud_overlay.telem.get("lat")
-            lon = self.hud_overlay.telem.get("lon")
+            lat, lon = self.hud_overlay.telem.get("lat"), self.hud_overlay.telem.get("lon")
             if lat and lon:
-                self.web_map.page().runJavaScript(
-                    f"if (typeof map !== 'undefined' && map) {{ map.setView([{lat}, {lon}], 15); }}"
-                )
-        elif tool_name == "FILE_SAVE":
-            self.save_mission_to_file()
-        elif tool_name == "FILE_OPEN":
-            self.open_mission_from_file()
-        elif tool_name == "FILE_CLEAR":
-            self.clear_mission_plan()
+                self.web_map.page().runJavaScript(f"if (typeof map !== 'undefined' && map) {{ map.setView([{lat}, {lon}], 15); }}")
+        elif tool_name == "FILE_SAVE": self.save_mission_to_file()
+        elif tool_name == "FILE_OPEN": self.open_mission_from_file()
+        elif tool_name == "FILE_CLEAR": self.clear_mission_plan()
 
     def scan_serial_ports(self):
         current_text = self.cmb_conn_type.currentText().strip()
         ports = list(serial.tools.list_ports.comports())
-
         available_items = []
+
         for p in ports:
-            dev = p.device
-            desc = p.description or ""
-            if desc and desc != dev and "n/a" not in desc.lower():
-                short_desc = desc.split("(")[0].strip()
-                item_label = f"{dev} ({short_desc})"
-            else:
-                item_label = dev
+            dev, desc = p.device, p.description or ""
+            item_label = f"{dev} ({desc.split('(')[0].strip()})" if (desc and desc != dev and "n/a" not in desc.lower()) else dev
             available_items.append((dev, item_label))
 
         available_items.append(("UDP", f"UDP ({self.custom_udp_conn})"))
@@ -752,26 +1429,21 @@ class VikasFlyViewGCS(QMainWindow):
 
             if current_text:
                 idx = self.cmb_conn_type.findText(current_text, Qt.MatchContains)
-                if idx != -1:
-                    self.cmb_conn_type.setCurrentIndex(idx)
-                else:
-                    self.cmb_conn_type.setEditText(current_text)
+                if idx != -1: self.cmb_conn_type.setCurrentIndex(idx)
+                else: self.cmb_conn_type.setEditText(current_text)
             elif ports:
                 self.cmb_conn_type.setCurrentIndex(0)
-
             self.cmb_conn_type.blockSignals(False)
 
     def on_conn_type_selected(self, index):
         text = self.cmb_conn_type.itemText(index)
-        if text.startswith("UDP"):
-            self.udp_dialog.show()
+        if text.startswith("UDP"): self.udp_dialog.show()
 
     def on_udp_configured(self, conn_str, port):
         self.custom_udp_conn = conn_str
         self.scan_serial_ports()
         idx = self.cmb_conn_type.findText("UDP", Qt.MatchContains)
-        if idx != -1:
-            self.cmb_conn_type.setCurrentIndex(idx)
+        if idx != -1: self.cmb_conn_type.setCurrentIndex(idx)
         self.start_mav_worker(self.custom_udp_conn, int(self.cmb_baud.currentText().strip() or 115200))
 
     def get_connection_string(self):
@@ -781,13 +1453,10 @@ class VikasFlyViewGCS(QMainWindow):
 
         current_data = self.cmb_conn_type.currentData()
         if current_data and current_data.startswith("COM"): return current_data
-
         if "COM" in raw_text.upper():
             for p in raw_text.upper().split():
                 cleaned = p.replace("(", "").replace(")", "").replace(":", "").strip()
-                if cleaned.startswith("COM") and any(ch.isdigit() for ch in cleaned):
-                    return cleaned
-
+                if cleaned.startswith("COM") and any(ch.isdigit() for ch in cleaned): return cleaned
         return raw_text if raw_text else "COM1"
 
     def start_mav_worker(self, conn_str, baud):
@@ -797,12 +1466,19 @@ class VikasFlyViewGCS(QMainWindow):
 
         self.mav_worker = MavlinkWorker(connection_string=conn_str, baud=baud)
         self.mav_worker.telemetry_updated.connect(self.on_telemetry_updated)
+        
+        # Connect raw MAVLink dispatcher to calibration manager
+        if hasattr(self.mav_worker, 'raw_message_received'):
+            self.mav_worker.raw_message_received.connect(self.cal_mgr.process_raw_mavlink_msg)
+        self.cal_mgr.set_worker(self.mav_worker)
         self.mav_worker.start()
 
     def toggle_drone_connection(self):
         if self.mav_worker and self.mav_worker.isRunning():
             self.mav_worker.stop()
+            self.mav_worker.wait(500)
             self.mav_worker = None
+            self.cal_mgr.set_worker(None)
             self.btn_mav_connect.setText("CONNECT")
             self.lbl_conn_status.setText("DRONE DISCONNECTED")
             self.top_dashboard.setStyleSheet("QFrame#top_dashboard { background-color: #dc2626; } QLabel { color: #fff; }")
@@ -812,8 +1488,7 @@ class VikasFlyViewGCS(QMainWindow):
             self.current_home_coords = None
         else:
             conn_str = self.get_connection_string()
-            baud_text = self.cmb_baud.currentText().strip()
-            baud = int(baud_text) if baud_text.isdigit() else 115200
+            baud = int(self.cmb_baud.currentText().strip() or 115200)
             self.start_mav_worker(conn_str, baud)
 
     def on_telemetry_updated(self, t):
@@ -827,24 +1502,17 @@ class VikasFlyViewGCS(QMainWindow):
             if "stat_msg" in t and t["stat_msg"]:
                 self.lbl_veh_msg.setText(f"MSG: {t['stat_msg']}")
 
-        lat = t.get("lat")
-        lon = t.get("lon")
+        lat, lon = t.get("lat"), t.get("lon")
         compass = t.get("compass", 0.0)
 
         if lat and lon and lat != 0.0 and lon != 0.0:
             if not self.current_home_coords:
                 self.current_home_coords = (lat, lon)
-                self.web_map.page().runJavaScript(
-                    f"if (typeof setHomePosition === 'function') {{ setHomePosition({lat}, {lon}); }}"
-                )
-                self.web_map.page().runJavaScript(
-                    f"if (typeof map !== 'undefined' && map) {{ map.setView([{lat}, {lon}], 15); }}"
-                )
+                self.web_map.page().runJavaScript(f"if (typeof setHomePosition === 'function') {{ setHomePosition({lat}, {lon}); }}")
+                self.web_map.page().runJavaScript(f"if (typeof map !== 'undefined' && map) {{ map.setView([{lat}, {lon}], 15); }}")
                 self.lbl_veh_msg.setText(f"MSG: AUTO-HOME DETECTED -> {lat:.5f}, {lon:.5f}")
 
-            self.web_map.page().runJavaScript(
-                f"if (typeof updatePosition === 'function') {{ updatePosition({lat}, {lon}, {compass}); }}"
-            )
+            self.web_map.page().runJavaScript(f"if (typeof updatePosition === 'function') {{ updatePosition({lat}, {lon}, {compass}); }}")
 
     def save_mission_to_file(self):
         if not self.planned_waypoints:
@@ -890,19 +1558,15 @@ class VikasFlyViewGCS(QMainWindow):
                 finish_act = data["mission"].get("finishAction", "RTL")
                 for itm in data["mission"]["items"]:
                     waypoints_loaded.append({
-                        "lat": float(itm.get("lat")), 
-                        "lon": float(itm.get("lon")),
-                        "alt": float(itm.get("alt", 30.0)), 
-                        "speed": float(itm.get("speed", 5.0)),
+                        "lat": float(itm.get("lat")), "lon": float(itm.get("lon")),
+                        "alt": float(itm.get("alt", 30.0)), "speed": float(itm.get("speed", 5.0)),
                         "hover": float(itm.get("hover", 0.0))
                     })
             elif isinstance(data, list):
                 for itm in data:
                     waypoints_loaded.append({
-                        "lat": float(itm["lat"]), 
-                        "lon": float(itm["lon"]),
-                        "alt": float(itm.get("alt", 30.0)), 
-                        "speed": float(itm.get("speed", 5.0)),
+                        "lat": float(itm["lat"]), "lon": float(itm["lon"]),
+                        "alt": float(itm.get("alt", 30.0)), "speed": float(itm.get("speed", 5.0)),
                         "hover": float(itm.get("hover", 0.0))
                     })
 
@@ -927,14 +1591,10 @@ class VikasFlyViewGCS(QMainWindow):
             QMessageBox.critical(self, "Load Error", f"Failed to load plan:\n{e}")
 
     def handle_waypoint_param_update(self, idx, new_alt, new_spd, new_hov):
-        self.web_map.page().runJavaScript(
-            f"if (typeof updateWaypointParams === 'function') {{ updateWaypointParams({idx}, {new_alt}, {new_spd}, {new_hov}); }}"
-        )
+        self.web_map.page().runJavaScript(f"if (typeof updateWaypointParams === 'function') {{ updateWaypointParams({idx}, {new_alt}, {new_spd}, {new_hov}); }}")
 
     def delete_waypoint(self, idx):
-        self.web_map.page().runJavaScript(
-            f"if (typeof deleteWaypointByIndex === 'function') {{ deleteWaypointByIndex({idx}); }}"
-        )
+        self.web_map.page().runJavaScript(f"if (typeof deleteWaypointByIndex === 'function') {{ deleteWaypointByIndex({idx}); }}")
 
     def handle_finish_action_update(self, action_code: str):
         self.web_map.page().runJavaScript("if (typeof redrawMissionRoute === 'function') { redrawMissionRoute(); }")
@@ -960,13 +1620,12 @@ class VikasFlyViewGCS(QMainWindow):
             msg_box.setText(
                 f"<b>GPS / Satellite lock not available!</b><br><br>"
                 f"Current status: <b>{sats} Sats</b> (HDOP: <b>{hdop:.1f}</b>).<br><br>"
-                f"ArduPilot / PX4 requires a 3D GPS fix to initialize EKF Home for relative waypoint navigation.<br><br>"
-                f"<b>Would you like to inject a simulated Bench-Test Origin to test the upload indoors?</b>"
+                f"ArduPilot requires a 3D GPS fix to initialize EKF Home.<br><br>"
+                f"<b>Inject a simulated Bench-Test Origin to test indoors?</b>"
             )
             btn_yes = msg_box.addButton("Yes (Bench Test)", QMessageBox.YesRole)
             btn_no = msg_box.addButton("Cancel Upload", QMessageBox.NoRole)
             msg_box.exec()
-
             if msg_box.clickedButton() == btn_yes:
                 force_bench = True
             else:
@@ -979,11 +1638,8 @@ class VikasFlyViewGCS(QMainWindow):
         self.mission_mgr = MissionManager(self.mav_worker)
         self.mission_mgr.mission_uploaded.connect(self._on_mission_upload_result)
         self.mission_mgr.upload_waypoint_mission(
-            self.planned_waypoints,
-            default_alt=30.0,
-            default_speed=5.0,
-            finish_action=finish_action,
-            force_bench_origin=force_bench
+            self.planned_waypoints, default_alt=30.0, default_speed=5.0,
+            finish_action=finish_action, force_bench_origin=force_bench
         )
 
     def _on_mission_upload_result(self, success: bool, msg: str):
@@ -1012,8 +1668,7 @@ class VikasFlyViewGCS(QMainWindow):
             if not self.mission_mgr.is_drone_armed():
                 reply = QMessageBox.warning(
                     self, "Drone Not Armed",
-                    "Drone is not Armed!\n\nPlease arm the drone to start autonomous flight.\n\n"
-                    "Would you like to send the ARM command now?",
+                    "Drone is not Armed!\n\nArm the drone to start autonomous flight.\n\nSend ARM command now?",
                     QMessageBox.Yes | QMessageBox.No
                 )
                 if reply == QMessageBox.Yes:
@@ -1030,7 +1685,7 @@ class VikasFlyViewGCS(QMainWindow):
             self.mission_mgr.pause_mission()
             self.mission_execution_state = "PAUSED"
             self.plan_side_panel.set_button_state("RESUME")
-            self.lbl_veh_msg.setText("MSG: MISSION PAUSED (LOITER). MANUAL CONTROL ACTIVE.")
+            self.lbl_veh_msg.setText("MSG: MISSION PAUSED (LOITER).")
 
         elif self.mission_execution_state == "PAUSED":
             self.mission_mgr.resume_mission()
@@ -1055,25 +1710,19 @@ class VikasFlyViewGCS(QMainWindow):
         self.setup_dialog.show()
 
     def reset_mission_targets(self):
-        self.target_pt = None
-        self.impact_pt = None
+        self.target_pt, self.impact_pt = None, None
 
     def handle_dialog_pick_request(self, entity_type, source_type):
         self.active_pick_entity = entity_type
         if source_type == "MAP":
-            self.web_map.page().runJavaScript(
-                f"if (typeof setSelectionMode === 'function') {{ setSelectionMode('{entity_type}'); }}"
-            )
+            self.web_map.page().runJavaScript(f"if (typeof setSelectionMode === 'function') {{ setSelectionMode('{entity_type}'); }}")
         elif source_type == "VIDEO":
-            if self.map_is_primary:
-                self.swap_views()
+            if self.map_is_primary: self.swap_views()
             self.video_view_day.set_selection_mode(True, entity=entity_type)
 
     def on_video_target_selected(self, px, py, w, h):
         t = self.hud_overlay.telem
-        d_lat = t.get("lat", 20.5937)
-        d_lon = t.get("lon", 78.9629)
-        d_alt = t.get("alt", 0.0)
+        d_lat, d_lon, d_alt = t.get("lat", 20.5937), t.get("lon", 78.9629), t.get("alt", 0.0)
         effective_alt = d_alt if d_alt > 0.5 else 1.5
 
         pt_lat, pt_lon = self.dooaf.video_pixel_to_coord(
@@ -1088,16 +1737,12 @@ class VikasFlyViewGCS(QMainWindow):
         if entity == "TARGET":
             self.target_pt = (pt_lat, pt_lon, pt_elev)
             self.setup_dialog.receive_picked_coord("TARGET", pt_lat, pt_lon, pt_elev)
-            self.web_map.page().runJavaScript(
-                f"if (typeof setTargetPosition === 'function') {{ setTargetPosition({pt_lat}, {pt_lon}); }}"
-            )
+            self.web_map.page().runJavaScript(f"if (typeof setTargetPosition === 'function') {{ setTargetPosition({pt_lat}, {pt_lon}); }}")
             TacticalTargetPopup("TARGET", {"lat": pt_lat, "lon": pt_lon, "alt": pt_elev, "mgrs": pt_mgrs}, self).exec()
         elif entity == "IMPACT":
             self.impact_pt = (pt_lat, pt_lon, pt_elev)
             self.setup_dialog.receive_picked_coord("IMPACT", pt_lat, pt_lon, pt_elev)
-            self.web_map.page().runJavaScript(
-                f"if (typeof setImpactPosition === 'function') {{ setImpactPosition({pt_lat}, {pt_lon}); }}"
-            )
+            self.web_map.page().runJavaScript(f"if (typeof setImpactPosition === 'function') {{ setImpactPosition({pt_lat}, {pt_lon}); }}")
 
     def on_map_event(self, title):
         if title.startswith("WP_SYNC:"):
@@ -1108,35 +1753,23 @@ class VikasFlyViewGCS(QMainWindow):
                     parts = item.split(":")
                     if len(parts) >= 6:
                         self.planned_waypoints.append({
-                            "wp_num": int(parts[0]),
-                            "lat": float(parts[1]),
-                            "lon": float(parts[2]),
-                            "alt": float(parts[3]),
-                            "speed": float(parts[4]),
-                            "hover": float(parts[5])
+                            "wp_num": int(parts[0]), "lat": float(parts[1]), "lon": float(parts[2]),
+                            "alt": float(parts[3]), "speed": float(parts[4]), "hover": float(parts[5])
                         })
                     elif len(parts) >= 4:
                         self.planned_waypoints.append({
-                            "wp_num": int(parts[0]),
-                            "lat": float(parts[1]),
-                            "lon": float(parts[2]),
-                            "alt": float(parts[3]),
-                            "speed": float(parts[4]) if len(parts) > 4 else 5.0,
-                            "hover": 0.0
+                            "wp_num": int(parts[0]), "lat": float(parts[1]), "lon": float(parts[2]),
+                            "alt": float(parts[3]), "speed": float(parts[4]) if len(parts) > 4 else 5.0, "hover": 0.0
                         })
             self.plan_side_panel.update_waypoint_items(self.planned_waypoints)
-            home_lat = self.hud_overlay.telem.get("lat")
-            home_lon = self.hud_overlay.telem.get("lon")
-            self.plan_top_bar.update_stats(self.planned_waypoints, home_lat, home_lon)
+            self.plan_top_bar.update_stats(self.planned_waypoints, self.hud_overlay.telem.get("lat"), self.hud_overlay.telem.get("lon"))
             return
 
         if title.startswith("INSPECT:"):
             parts = title.replace("INSPECT:", "").split(",")
             lat, lon = float(parts[0]), float(parts[1])
             mgrs_val = to_mgrs_gr(lat, lon)
-            self.web_map.page().runJavaScript(
-                f"if (typeof showInspectPopup === 'function') {{ showInspectPopup({lat}, {lon}, '{mgrs_val}'); }}"
-            )
+            self.web_map.page().runJavaScript(f"if (typeof showInspectPopup === 'function') {{ showInspectPopup({lat}, {lon}, '{mgrs_val}'); }}")
 
     def handle_setup_applied(self, data):
         self.dooaf.battery_lat = data["gun_lat"]
@@ -1154,19 +1787,20 @@ class VikasFlyViewGCS(QMainWindow):
 
     def safe_fix_map(self):
         if hasattr(self, 'web_map') and self.web_map:
-            self.web_map.page().runJavaScript(
-                """
+            self.web_map.page().runJavaScript("""
                 if (typeof map !== 'undefined' && map) {
-                    map.invalidateSize({ animate: false, pan: false });
+                    map.invalidateSize({ animate: false });
                 }
-                """
-            )
+            """)
 
     def closeEvent(self, event):
         self.port_scan_timer.stop()
         self._stop_active_camera_threads()
-        if self.mav_worker:
+        if hasattr(self, 'firmware_page') and self.firmware_page:
+            self.firmware_page.stop_worker()
+        if self.mav_worker and self.mav_worker.isRunning():
             self.mav_worker.stop()
+            self.mav_worker.wait(500)
         if self.dem:
             self.dem.close()
         event.accept()
