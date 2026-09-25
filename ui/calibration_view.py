@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont, QColor, QPainter, QPen, QBrush
 
 # ==============================================================================
-# COMPACT 16-CHANNEL PWM STICK / SWITCH BAR
+# DYNAMIC PWM STICK / SWITCH BAR
 # ==============================================================================
 class PwmBarWidget(QWidget):
     def __init__(self, label_text, parent=None):
@@ -39,12 +39,12 @@ class PwmBarWidget(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
 
-        # Channel text
+        # Channel label
         p.setPen(QColor("#f1f5f9"))
         p.setFont(QFont("Consolas", 7, QFont.Bold))
         p.drawText(2, h - 8, self.label_text)
 
-        bar_x = 72
+        bar_x = 76
         bar_w = w - bar_x - 100
         bar_y = 4
         bar_h = h - 8
@@ -54,7 +54,7 @@ class PwmBarWidget(QWidget):
         p.setBrush(QBrush(QColor("#080d14")))
         p.drawRoundedRect(bar_x, bar_y, bar_w, bar_h, 3, 3)
 
-        # 1500us Center Dash
+        # 1500us neutral center line
         cx = bar_x + (bar_w / 2.0)
         p.setPen(QPen(QColor("#475569"), 1, Qt.DashLine))
         p.drawLine(cx, bar_y, cx, bar_y + bar_h)
@@ -66,7 +66,7 @@ class PwmBarWidget(QWidget):
         p.setBrush(QBrush(QColor("#0284c7") if self.val >= 1500 else QColor("#0f766e")))
         p.drawRoundedRect(bar_x + 1, bar_y + 1, fill_w, bar_h - 2, 2, 2)
 
-        # Microsecond text
+        # Microsecond readout
         p.setPen(QColor("#00ffcc"))
         p.setFont(QFont("Consolas", 8, QFont.Bold))
         p.drawText(w - 95, h - 8, f"{self.val}µs")
@@ -78,7 +78,7 @@ class PwmBarWidget(QWidget):
 
 
 # ==============================================================================
-# SENSOR CALIBRATION WIZARD (UP TO 16-CH RADIO & 6-AXIS VISUALS)
+# SENSOR CALIBRATION WIZARD (AUTO-ADAPTIVE RC CHANNEL DISPLAY)
 # ==============================================================================
 class SensorCalibrationView(QWidget):
     back_to_home = Signal()
@@ -87,6 +87,7 @@ class SensorCalibrationView(QWidget):
         super().__init__(parent)
         self.cal_mgr = cal_mgr
         self.rc_is_calibrating = False
+        self.current_active_channel_count = 0
         self.init_ui()
         self.wire_signals()
 
@@ -156,7 +157,7 @@ class SensorCalibrationView(QWidget):
         self.h_panels_splitter = QSplitter(Qt.Horizontal)
 
         # -------------------------------------------------------------
-        # LEFT COLUMN (Accel & 16-Channel Radio)
+        # LEFT COLUMN (Accel & Adaptive Radio)
         # -------------------------------------------------------------
         self.left_v_splitter = QSplitter(Qt.Vertical)
 
@@ -211,16 +212,16 @@ class SensorCalibrationView(QWidget):
         ac_layout.addLayout(ac_btns)
         self.left_v_splitter.addWidget(accel_card)
 
-        # 2. Radio Card (Supports 16 Channels in 2 Columns: Skydroid, MK15, MK32)
+        # 2. Radio Card (Dynamically detects active channel count: 4, 6, 8, 10, 12, 14, 16)
         rc_card = QFrame()
         rc_card.setProperty("class", "card")
         rc_layout = QVBoxLayout(rc_card)
         rc_layout.setSpacing(6)
 
         rc_title_row = QHBoxLayout()
-        rc_title = QLabel("3. RADIO / RC STICKS (16-CHANNELS: T12 / MK15 / MK32)")
-        rc_title.setStyleSheet("font-weight: 900; font-size: 9.5pt; color: #38bdf8;")
-        rc_title_row.addWidget(rc_title)
+        self.rc_title = QLabel("3. RADIO / RC STICKS (DETECTING CHANNELS...)")
+        self.rc_title.setStyleSheet("font-weight: 900; font-size: 9.5pt; color: #38bdf8;")
+        rc_title_row.addWidget(self.rc_title)
         rc_title_row.addStretch()
 
         self.btn_rc_cal = QPushButton("CALIBRATE RADIO")
@@ -229,17 +230,16 @@ class SensorCalibrationView(QWidget):
         rc_title_row.addWidget(self.btn_rc_cal)
         rc_layout.addLayout(rc_title_row)
 
-        # 2-column scrollable grid for all 16 channels
         rc_grid_widget = QWidget()
-        rc_grid = QGridLayout(rc_grid_widget)
-        rc_grid.setContentsMargins(0, 0, 0, 0)
-        rc_grid.setSpacing(4)
+        self.rc_grid = QGridLayout(rc_grid_widget)
+        self.rc_grid.setContentsMargins(0, 0, 0, 0)
+        self.rc_grid.setSpacing(4)
 
         channel_names = [
             "CH1 (Roll)", "CH2 (Pitch)", "CH3 (Thr)", "CH4 (Yaw)",
             "CH5 (Mode)", "CH6 (Aux1)", "CH7 (Aux2)", "CH8 (Aux3)",
-            "CH9 (Cam P)", "CH10 (Cam Y)", "CH11 (Aux4)", "CH12 (Aux5)",
-            "CH13 (Aux6)", "CH14 (Aux7)", "CH15 (Aux8)", "CH16 (Aux9)"
+            "CH9 (Aux4)", "CH10 (Aux5)", "CH11 (Aux6)", "CH12 (Aux7)",
+            "CH13 (Aux8)", "CH14 (Aux9)", "CH15 (Aux10)", "CH16 (Aux11)"
         ]
 
         self.bars = []
@@ -248,7 +248,7 @@ class SensorCalibrationView(QWidget):
             self.bars.append(bar)
             row = i % 8
             col = i // 8
-            rc_grid.addWidget(bar, row, col)
+            self.rc_grid.addWidget(bar, row, col)
 
         rc_scroll = QScrollArea()
         rc_scroll.setWidgetResizable(True)
@@ -329,7 +329,7 @@ class SensorCalibrationView(QWidget):
         self.right_v_splitter.addWidget(esc_card)
         self.h_panels_splitter.addWidget(self.right_v_splitter)
 
-        # Set balanced default widths (Left: 60%, Right: 40%)
+        # Set default proportions
         self.h_panels_splitter.setSizes([850, 550])
         self.left_v_splitter.setSizes([200, 380])
         self.right_v_splitter.setSizes([240, 240])
@@ -352,7 +352,7 @@ class SensorCalibrationView(QWidget):
         self.console = QTextEdit()
         self.console.setObjectName("console_output")
         self.console.setReadOnly(True)
-        self.console.append("[System] Sensor hardware calibration wizard ready. 16-channel radio monitoring active.")
+        self.console.append("[System] Sensor hardware calibration wizard ready. Universal RC protocol detection active.")
         cc_layout.addWidget(self.console)
 
         self.v_master_splitter.addWidget(console_container)
@@ -381,7 +381,6 @@ class SensorCalibrationView(QWidget):
             self.update_step_badges(1)
 
     def next_accel(self):
-        step = self.cal_mgr.accel_step_index
         self.cal_mgr.advance_accel_step()
         self.update_step_badges(self.cal_mgr.accel_step_index)
         if self.cal_mgr.accel_step_index == 0:
@@ -417,24 +416,38 @@ class SensorCalibrationView(QWidget):
     def toggle_rc_calibration(self):
         if not self.rc_is_calibrating:
             self.rc_is_calibrating = True
-            for b in self.bars: b.reset_limits()
+            for b in self.bars:
+                if b.isVisible():
+                    b.reset_limits()
             self.btn_rc_cal.setText("SAVE LIMITS (FINISH)")
             self.btn_rc_cal.setStyleSheet("background: #16a34a; border: 1px solid #4ade80; color: white; font-weight: bold; border-radius: 4px; padding: 5px 12px;")
-            self.log_message("[*] Move all sticks, dials, and switches on your remote in full circles...")
+            self.log_message(f"[*] Calibrating {self.current_active_channel_count} active channels. Move all sticks, dials, and switches to extremes...")
         else:
             self.rc_is_calibrating = False
             self.btn_rc_cal.setText("CALIBRATE RADIO")
             self.btn_rc_cal.setStyleSheet("")
             limits = {}
-            for i in range(16):
+            for i in range(self.current_active_channel_count):
                 limits[f"RC{i+1}_MIN"] = self.bars[i].min_val
                 limits[f"RC{i+1}_MAX"] = self.bars[i].max_val
                 limits[f"RC{i+1}_TRIM"] = self.bars[i].trim_val
             self.cal_mgr.save_rc_limits(limits)
 
     def on_rc_raw_received(self, pwm_list):
-        for i in range(min(16, len(pwm_list))):
-            self.bars[i].set_value(pwm_list[i])
+        active_count = len(pwm_list)
+
+        # Update title header when a change in active channel count is detected
+        if active_count != self.current_active_channel_count:
+            self.current_active_channel_count = active_count
+            self.rc_title.setText(f"3. RADIO / RC STICKS ({active_count} ACTIVE CHANNELS DETECTED)")
+
+        # Show only bars that exist on this specific remote, hide the rest
+        for i, bar in enumerate(self.bars):
+            if i < active_count:
+                bar.show()
+                bar.set_value(pwm_list[i])
+            else:
+                bar.hide()
 
     def confirm_esc_trigger(self):
         reply = QMessageBox.critical(

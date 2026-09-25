@@ -32,6 +32,7 @@ from core.dooaf_engine import DOOAFEngine
 from core.video_stream import GimbalCameraThread
 from core.dem_manager import DemManager
 from core.mgrs_helper import to_mgrs_gr
+from core.calibration_manager import CalibrationManager
 from core.dooaf_report_generator import generate_dooaf_html_report
 from ui.video_widget import ClickableVideoLabel
 from ui.hud_overlay import TacticalOverlayHUD
@@ -43,8 +44,6 @@ from ui.coordinate_goto_dialog import CoordinateGotoDialog
 from ui.flight_plan_widgets import PlanTopStatsBar, PlanLeftToolBar, PlanRightMissionPanel
 from ui.gimbal_control_panel import GimbalControlPanel
 from ui.camera_config_dialog import CameraConfigDialog, CONFIG_FILE
-
-# Clean import of the flexible 16-channel Sensor Calibration View
 from ui.calibration_view import SensorCalibrationView
 
 MAIN_STYLE = """
@@ -113,204 +112,7 @@ QComboBox.mav_combo_box QAbstractItemView {
 """
 
 # ==============================================================================
-# 1. SENSOR CALIBRATION MAVLINK DISPATCHER (16 CHANNELS)
-# ==============================================================================
-class CalibrationManager(QObject):
-    accel_prompt_sig = Signal(str)
-    compass_progress_sig = Signal(int)
-    compass_done_sig = Signal(bool, str)
-    rc_channels_sig = Signal(list)
-    log_sig = Signal(str)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.mav_worker = None
-        self.accel_step_index = 0
-        self.active_cal_type = None
-
-    def set_worker(self, worker):
-        self.mav_worker = worker
-
-    @property
-    def master(self):
-        return self.mav_worker.master if (self.mav_worker and getattr(self.mav_worker, 'connected', False)) else None
-
-    def start_accel_6point(self):
-        m = self.master
-        if not m:
-            self.log_sig.emit("[!] Telemetry not connected. Connect drone first.")
-            return False
-
-        self.active_cal_type = "ACCEL"
-        self.accel_step_index = 1
-        self.log_sig.emit("[*] Initiating 6-Axis 3D Accel Calibration...")
-        try:
-            m.mav.command_long_send(
-                m.target_system, m.target_component,
-                mavutil.mavlink.MAV_CMD_PREFLIGHT_CALIBRATION,
-                0, 0, 0, 0, 0, 1, 0, 0
-            )
-            self.accel_prompt_sig.emit("Place vehicle LEVEL and press NEXT STEP.")
-            return True
-        except Exception as e:
-            self.log_sig.emit(f"[ERROR] Failed to send Accel Cal command: {e}")
-            return False
-
-    def advance_accel_step(self):
-        m = self.master
-        if not m:
-            return
-
-        steps = [
-            (1, "Place vehicle LEVEL and press NEXT STEP."),
-            (2, "Place vehicle on its LEFT side and press NEXT STEP."),
-            (3, "Place vehicle on its RIGHT side and press NEXT STEP."),
-            (4, "Place vehicle NOSE DOWN and press NEXT STEP."),
-            (5, "Place vehicle NOSE UP and press NEXT STEP."),
-            (6, "Place vehicle on its BACK and press NEXT STEP.")
-        ]
-
-        if self.accel_step_index <= 6:
-            pos_val = self.accel_step_index
-            self.log_sig.emit(f"[*] Confirmed Step {pos_val}/6. Transmitting position ack...")
-            try:
-                m.mav.command_long_send(
-                    m.target_system, m.target_component,
-                    mavutil.mavlink.MAV_CMD_ACCELCAL_VEHICLE_POS,
-                    0, pos_val, 0, 0, 0, 0, 0, 0
-                )
-            except Exception as e:
-                self.log_sig.emit(f"[ERROR] Failed to send step acknowledgment: {e}")
-
-            if self.accel_step_index < 6:
-                next_prompt = steps[self.accel_step_index][1]
-                self.accel_prompt_sig.emit(next_prompt)
-                self.accel_step_index += 1
-            else:
-                self.accel_prompt_sig.emit("Calibration Completed! Writing offsets to flash...")
-                self.log_sig.emit("[+] 6-Axis Accel Calibration Complete.")
-                self.active_cal_type = None
-                self.accel_step_index = 0
-
-    def calibrate_simple_level(self):
-        m = self.master
-        if not m:
-            self.log_sig.emit("[!] Drone not connected.")
-            return False
-        self.log_sig.emit("[*] Calibrating Horizon Level (Keep vehicle flat)...")
-        try:
-            m.mav.command_long_send(
-                m.target_system, m.target_component,
-                mavutil.mavlink.MAV_CMD_PREFLIGHT_CALIBRATION,
-                0, 0, 0, 0, 0, 2, 0, 0
-            )
-            self.log_sig.emit("[+] Horizon level set successfully.")
-            return True
-        except Exception as e:
-            self.log_sig.emit(f"[ERROR] Level calibration failed: {e}")
-            return False
-
-    def start_compass_cal(self):
-        m = self.master
-        if not m:
-            self.log_sig.emit("[!] Drone not connected.")
-            return False
-
-        self.active_cal_type = "COMPASS"
-        self.log_sig.emit("[*] Starting Onboard Compass Calibration. Rotate drone slowly around all axes...")
-        try:
-            m.mav.command_long_send(
-                m.target_system, m.target_component,
-                mavutil.mavlink.MAV_CMD_DO_START_MAG_CAL,
-                0, 0, 0, 1, 0, 0, 0, 0
-            )
-            return True
-        except Exception as e:
-            self.log_sig.emit(f"[ERROR] Could not start compass calibration: {e}")
-            return False
-
-    def cancel_compass_cal(self):
-        m = self.master
-        if not m: return
-        try:
-            m.mav.command_long_send(
-                m.target_system, m.target_component,
-                mavutil.mavlink.MAV_CMD_DO_CANCEL_MAG_CAL,
-                0, 0, 0, 0, 0, 0, 0, 0
-            )
-            self.log_sig.emit("[!] Compass Calibration Cancelled.")
-        except Exception:
-            pass
-        self.active_cal_type = None
-
-    def trigger_esc_calibration(self):
-        m = self.master
-        if not m:
-            self.log_sig.emit("[!] Drone not connected.")
-            return False
-
-        self.log_sig.emit("[*] Writing parameter: ESC_CALIBRATION = 3 (Auto ESC on boot)...")
-        try:
-            m.param_set_send(b"ESC_CALIBRATION", 3.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
-            time.sleep(0.3)
-            self.log_sig.emit("[*] Sending preflight reboot command to flight controller...")
-            m.mav.command_long_send(
-                m.target_system, m.target_component,
-                mavutil.mavlink.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN,
-                0, 1, 0, 0, 0, 0, 0, 0
-            )
-            self.log_sig.emit("[+] Target rebooting. Disconnect battery and reconnect to listen for ESC beeps.")
-            return True
-        except Exception as e:
-            self.log_sig.emit(f"[ERROR] ESC Calibration setup failed: {e}")
-            return False
-
-    def save_rc_limits(self, limits_dict):
-        m = self.master
-        if not m:
-            self.log_sig.emit("[!] Drone not connected.")
-            return False
-
-        self.log_sig.emit("[*] Committing RC Stick Min/Max/Trim parameters to flight controller...")
-        try:
-            for param_name, val in limits_dict.items():
-                m.param_set_send(param_name.encode('ascii'), float(val), mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
-                time.sleep(0.02)
-            self.log_sig.emit("[+] 16-Channel RC Limits committed successfully.")
-            return True
-        except Exception as e:
-            self.log_sig.emit(f"[ERROR] Failed to save RC limits: {e}")
-            return False
-
-    def process_raw_mavlink_msg(self, msg):
-        msg_type = msg.get_type()
-        if msg_type == "MAG_CAL_PROGRESS":
-            pct = int(getattr(msg, "completion_pct", 0))
-            self.compass_progress_sig.emit(pct)
-
-        elif msg_type == "MAG_CAL_REPORT":
-            status = getattr(msg, "cal_status", 0)
-            success = (status in [1, 4])
-            self.compass_done_sig.emit(success, f"Report status code: {status}")
-
-        elif msg_type == "STATUSTEXT":
-            txt = getattr(msg, "text", "")
-            if any(k in txt.lower() for k in ["place", "accel", "calibration", "holding"]):
-                self.accel_prompt_sig.emit(txt)
-                self.log_sig.emit(f"[FC] {txt}")
-
-        elif msg_type == "RC_CHANNELS":
-            # Extract up to 16 channels for Skydroid T12, MK15, MK32
-            pwm_list = [getattr(msg, f"chan{i}_raw", 1500) for i in range(1, 17)]
-            self.rc_channels_sig.emit(pwm_list)
-
-        elif msg_type == "RC_CHANNELS_RAW":
-            pwm_list = [getattr(msg, f"chan{i}_raw", 1500) for i in range(1, 9)]
-            self.rc_channels_sig.emit(pwm_list)
-
-
-# ==============================================================================
-# 2. MISSION PLANNER VEHICLE BUTTON & FIRMWARE INSTALLER
+# MISSION PLANNER VEHICLE BUTTON & FIRMWARE INSTALLER
 # ==============================================================================
 class MissionPlannerVehicleButton(QPushButton):
     def __init__(self, title, version_text, vehicle_type, kind="quad", parent=None):
@@ -809,7 +611,7 @@ class VikasFlyViewGCS(QMainWindow):
         self.firmware_page.back_to_home.connect(self.show_home_view)
         self.main_stack.addWidget(self.firmware_page)
 
-        # PAGE 2: Sensor Calibration Wizard (Dynamic Drag-to-Resize View from ui/calibration_view.py)
+        # PAGE 2: Sensor Calibration Wizard (Dynamic Drag-to-Resize View)
         self.cal_mgr = CalibrationManager(parent=self)
         self.cal_page = SensorCalibrationView(self.cal_mgr, self.main_stack)
         self.cal_page.back_to_home.connect(self.show_home_view)
@@ -967,7 +769,7 @@ class VikasFlyViewGCS(QMainWindow):
         self.btn_ctrl_fw.clicked.connect(self.show_firmware_view)
         bw_layout.addWidget(self.btn_ctrl_fw)
 
-        # Calibration Button
+        # Sensors Calibration Button
         self.btn_ctrl_cal = QPushButton("🛠 SENSORS", self.cp_buttons_widget)
         self.btn_ctrl_cal.setObjectName("ctrl_cal_btn")
         self.btn_ctrl_cal.clicked.connect(self.show_calibration_view)
@@ -1088,6 +890,9 @@ class VikasFlyViewGCS(QMainWindow):
     def show_calibration_view(self):
         self.main_stack.setCurrentIndex(2)
         self.lbl_veh_msg.setText("MSG: SENSOR HARDWARE CALIBRATION OPENED")
+        # Request stream update from flight controller immediately
+        if hasattr(self, 'cal_mgr') and self.cal_mgr:
+            self.cal_mgr.request_rc_stream()
 
     def toggle_control_panel(self):
         self.control_panel_is_minimized = not self.control_panel_is_minimized
@@ -1464,8 +1269,13 @@ class VikasFlyViewGCS(QMainWindow):
         self.btn_mav_connect.setText("DISCONNECT")
         self.lbl_veh_msg.setText(f"MSG: OPENING {conn_str} @ {baud}...")
 
+        
+        # In VikasFlyViewGCS.start_mav_worker:
         self.mav_worker = MavlinkWorker(connection_string=conn_str, baud=baud)
         self.mav_worker.telemetry_updated.connect(self.on_telemetry_updated)
+        self.mav_worker.raw_message_received.connect(self.cal_mgr.process_raw_mavlink_msg)
+        self.cal_mgr.set_worker(self.mav_worker)
+        self.mav_worker.start()
         
         # Connect raw MAVLink dispatcher to calibration manager
         if hasattr(self.mav_worker, 'raw_message_received'):
